@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -18,6 +19,22 @@ SYSTEM_PROMPT = (
 
 def _format_context(chunks: list[SearchResult]) -> str:
     return "\n\n".join(f"[{r.chunk.id}] {r.chunk.content}" for r in chunks)
+
+
+def _normalize(text: str) -> str:
+    text = text.strip().strip("\"'“”‘’")
+    return re.sub(r"\s+", " ", text).lower()
+
+
+def quote_in_chunk(quote: str, chunk_content: str) -> bool:
+    """Deterministic check that `quote` actually appears in `chunk_content`,
+    tolerant of whitespace and quote-mark differences. This is the ground
+    truth for whether an LLM-produced quote is real or hallucinated - it
+    does not trust the LLM's own supported/quote claim."""
+    normalized_quote = _normalize(quote)
+    if not normalized_quote:
+        return False
+    return normalized_quote in _normalize(chunk_content)
 
 
 def build_agent(
@@ -73,6 +90,14 @@ class Fact(BaseModel):
     statement: str = Field(
         description="a single factual statement supported by that chunk"
     )
+    quote: str = Field(description="verbatim span from that chunk backing this fact")
+    quote_verified: bool = Field(
+        default=False,
+        description=(
+            "set by us, not the model: whether `quote` was deterministically "
+            "found in the cited chunk"
+        ),
+    )
 
 
 class AnswerOutput(BaseModel):
@@ -80,16 +105,30 @@ class AnswerOutput(BaseModel):
         description="atomic facts backing the answer; empty if none apply"
     )
     answer: str = Field(description="the synthesized, user-facing answer")
+    hallucinated_quotes: int = Field(
+        default=0,
+        description=(
+            "set by us, not the model: how many facts had a quote we could "
+            "not find in the cited chunk"
+        ),
+    )
 
 
 class FactCheck(BaseModel):
     statement: str = Field(description="exact copy of the fact's statement checked")
-    chunk_id: str = Field(description="chunk id the fact cited")
     supported: Literal["yes", "partial", "no"]
+    chunk_id: str = Field(description="chunk id the fact cited")
     quote: str = Field(
         description=(
             "verbatim span from that chunk backing this fact, empty if unsupported"
         )
+    )
+    quote_verified: bool = Field(
+        default=False,
+        description=(
+            "set by us, not the model: whether `quote` was deterministically "
+            "found in the cited chunk"
+        ),
     )
 
 
@@ -98,6 +137,13 @@ class VerificationOutput(BaseModel):
     contradictions: list[str] = Field(
         default_factory=list,
         description="answer claims that conflict with the data",
+    )
+    hallucinated_quotes: int = Field(
+        default=0,
+        description=(
+            "set by us, not the model: how many facts claimed yes/partial "
+            "support with a quote we could not find in the cited chunk"
+        ),
     )
 
 
@@ -117,10 +163,15 @@ DECOMPOSE_SUFFIX = (
 
 ANSWER_SUFFIX = (
     "\n\nUsing only the context passages above, list the atomic facts that "
-    "support an answer, each citing the id of the single chunk it came from. "
-    "Then write the final answer from those facts alone - the answer must "
-    "not say anything its facts don't already say. If the context does not "
-    "support an answer, say so plainly and leave facts empty."
+    "support an answer, each citing the id of the single chunk it came from "
+    "plus a verbatim quote copied exactly from that chunk backing it - do "
+    "not paraphrase or alter the quote in any way. Then write the final "
+    "answer from those facts alone - the answer must not say anything its "
+    "facts don't already say. Never state that a source does not mention, "
+    "cover, or attribute something merely because no fact says it - only "
+    "state an absence if a fact explicitly says the source denies or rules "
+    "it out. If the context does not support an answer, say so plainly and "
+    "leave facts empty."
 )
 
 VERIFICATION_SUFFIX = (
@@ -172,3 +223,39 @@ def format_prompt_prefix(question: str, chunks: list[SearchResult]) -> str:
 
 def format_answer_suffix(answer: AnswerOutput) -> str:
     return f"\n\nAnswer:\n{answer.model_dump_json()}"
+
+
+def chunks_by_id(chunks: list[SearchResult]) -> dict[str, str]:
+    return {r.chunk.id: r.chunk.content for r in chunks}
+
+
+def verify_answer_quotes(answer: AnswerOutput, contents: dict[str, str]) -> None:
+    """Deterministically check each fact's quote against its cited chunk's
+    actual text, in place. This is the ground truth check on the Answerer's
+    own claims, run before the Verifier ever sees them."""
+    hallucinated = 0
+    for fact in answer.facts:
+        fact.quote_verified = quote_in_chunk(
+            fact.quote, contents.get(fact.chunk_id, "")
+        )
+        if not fact.quote_verified:
+            hallucinated += 1
+    answer.hallucinated_quotes = hallucinated
+
+
+def verify_verification_quotes(
+    verification: VerificationOutput, contents: dict[str, str]
+) -> None:
+    """Deterministically check each FactCheck's quote against its cited
+    chunk, in place. A yes/partial verdict backed by a quote we cannot find
+    is downgraded to "no" - we do not trust the Verifier's own say-so."""
+    hallucinated = 0
+    for check in verification.facts:
+        check.quote_verified = quote_in_chunk(
+            check.quote, contents.get(check.chunk_id, "")
+        )
+        if not check.quote_verified:
+            hallucinated += 1
+            if check.supported != "no":
+                check.supported = "no"
+    verification.hallucinated_quotes = hallucinated

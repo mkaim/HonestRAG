@@ -28,6 +28,20 @@
       white-space: pre-wrap;
       line-height: 1.4;
     }
+    #risk {
+      margin-top: 1rem;
+      padding: 0.5rem 0.75rem;
+      border-radius: 4px;
+      font-size: 0.85rem;
+    }
+    #risk.ok {
+      background: #e6f4ea;
+      color: #1e7b34;
+    }
+    #risk.warn {
+      background: #fdecea;
+      color: #b3261e;
+    }
     #status {
       margin-top: 0.5rem;
       color: #666;
@@ -78,6 +92,7 @@
   <button id="send">Send</button>
   <div id="status"></div>
   <div id="stages"></div>
+  <div id="risk" hidden></div>
   <div id="answer"></div>
   <details id="extras" hidden>
     <summary>Facts, verification &amp; completeness</summary>
@@ -92,6 +107,7 @@
     const answer = document.getElementById("answer");
     const extras = document.getElementById("extras");
     const extrasBody = document.getElementById("extras-body");
+    const risk = document.getElementById("risk");
 
     const STAGE_LABELS = {
       decompose: "Decomposing question",
@@ -139,6 +155,7 @@
       stages.innerHTML = "";
       answer.textContent = "";
       extras.hidden = true;
+      risk.hidden = true;
 
       try {
         const res = await fetch("/api/ask", {
@@ -178,6 +195,24 @@
                 2,
               );
               extras.hidden = false;
+
+              const answerHallucinated = event.data.facts.filter(
+                (f) => !f.quote_verified,
+              ).length;
+              const verifyHallucinated =
+                event.data.verification.hallucinated_quotes || 0;
+              const total = answerHallucinated + verifyHallucinated;
+              risk.hidden = false;
+              if (total === 0) {
+                risk.className = "ok";
+                risk.textContent = "All cited quotes verified against source chunks.";
+              } else {
+                risk.className = "warn";
+                risk.textContent =
+                  `${total} unverifiable quote(s) detected ` +
+                  `(${answerHallucinated} in the answer, ${verifyHallucinated} ` +
+                  `in verification) - treat those facts as unsupported.`;
+              }
             } else {
               renderStage(event);
             }
