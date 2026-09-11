@@ -197,7 +197,7 @@
               extras.hidden = false;
 
               const answerHallucinated = event.data.facts.filter(
-                (f) => !f.quote_verified,
+                (f) => !f.verified,
               ).length;
               const verifyHallucinated =
                 event.data.verification.hallucinated_quotes || 0;

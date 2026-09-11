@@ -1,5 +1,6 @@
 import json
 import re
+from dataclasses import asdict, dataclass, field
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -56,8 +57,10 @@ def build_agent(
     )
 
 
-class RoleResult[T: BaseModel](BaseModel):
+@dataclass(frozen=True)
+class RoleResult[T: BaseModel]:
     output: T
+    verification: object | None = None
     raw_messages: str | None = None
 
 
@@ -72,10 +75,13 @@ class Role[T: BaseModel]:
     def __init__(self, agent: Agent):
         self.agent = agent
 
-    def verify(self, output: T, contents: dict[str, str]) -> None:
-        """Deterministic, code-level check applied to `output` in place after
-        the model call, given each cited chunk_id's actual content. No-op by
-        default; roles that produce quotes override this."""
+    def verify(self, output: T, contents: dict[str, str]) -> object | None:
+        """Deterministic, code-level check of `output` against each cited
+        chunk_id's actual content, returning this role's own result object.
+        Returns None by default; roles that produce quotes override this
+        and define their own result dataclass - the LLM's Output schema is
+        never mutated, so it stays exactly what the model produced."""
+        return None
 
     async def run(
         self,
@@ -86,9 +92,11 @@ class Role[T: BaseModel]:
     ) -> RoleResult[T]:
         prompt = prompt_prefix + self.SUFFIX
         result = await self.agent.run(prompt, output_type=self.Output)
-        self.verify(result.output, contents)
+        verification = self.verify(result.output, contents)
         raw_messages = result.new_messages_json().decode() if debug else None
-        return RoleResult(output=result.output, raw_messages=raw_messages)
+        return RoleResult(
+            output=result.output, verification=verification, raw_messages=raw_messages
+        )
 
 
 class DecomposeOutput(BaseModel):
@@ -103,13 +111,6 @@ class Fact(BaseModel):
         description="a single factual statement supported by that chunk"
     )
     quote: str = Field(description="verbatim span from that chunk backing this fact")
-    quote_verified: bool = Field(
-        default=False,
-        description=(
-            "set by us, not the model: whether `quote` was deterministically "
-            "found in the cited chunk"
-        ),
-    )
 
 
 class AnswerOutput(BaseModel):
@@ -117,13 +118,6 @@ class AnswerOutput(BaseModel):
         description="atomic facts backing the answer; empty if none apply"
     )
     answer: str = Field(description="the synthesized, user-facing answer")
-    hallucinated_quotes: int = Field(
-        default=0,
-        description=(
-            "set by us, not the model: how many facts had a quote we could "
-            "not find in the cited chunk"
-        ),
-    )
 
 
 class FactCheck(BaseModel):
@@ -135,13 +129,6 @@ class FactCheck(BaseModel):
             "verbatim span from that chunk backing this fact, empty if unsupported"
         )
     )
-    quote_verified: bool = Field(
-        default=False,
-        description=(
-            "set by us, not the model: whether `quote` was deterministically "
-            "found in the cited chunk"
-        ),
-    )
 
 
 class VerificationOutput(BaseModel):
@@ -149,13 +136,6 @@ class VerificationOutput(BaseModel):
     contradictions: list[str] = Field(
         default_factory=list,
         description="answer claims that conflict with the data",
-    )
-    hallucinated_quotes: int = Field(
-        default=0,
-        description=(
-            "set by us, not the model: how many facts claimed yes/partial "
-            "support with a quote we could not find in the cited chunk"
-        ),
     )
 
 
@@ -166,7 +146,7 @@ class SubQuestionCoverage(BaseModel):
     )
     chunk_id: str = Field(
         default="",
-        description=("id of the chunk backing coverage, empty if covered is false"),
+        description="id of the chunk backing coverage, empty if covered is false",
     )
     quote: str = Field(
         default="",
@@ -174,39 +154,11 @@ class SubQuestionCoverage(BaseModel):
             "verbatim span from that chunk backing coverage, empty if covered is false"
         ),
     )
-    quote_verified: bool = Field(
-        default=False,
-        description=(
-            "set by us, not the model: whether `quote` was deterministically "
-            "found in the cited chunk"
-        ),
-    )
 
 
 class CompletenessOutput(BaseModel):
     subquestions: list[SubQuestionCoverage] = Field(
         description="coverage of each sub-question the answer was built from"
-    )
-    complete: bool = Field(
-        default=False,
-        description=(
-            "set by us, not the model: true iff every sub-question is "
-            "covered with a verified quote"
-        ),
-    )
-    missing: list[str] = Field(
-        default_factory=list,
-        description=(
-            "set by us, not the model: the question text of every "
-            "uncovered sub-question"
-        ),
-    )
-    hallucinated_quotes: int = Field(
-        default=0,
-        description=(
-            "set by us, not the model: how many sub-questions claimed "
-            "covered with a quote we could not find in the cited chunk"
-        ),
     )
 
 
@@ -252,6 +204,31 @@ class Decomposer(Role[DecomposeOutput]):
     Output = DecomposeOutput
 
 
+@dataclass(frozen=True)
+class QuoteResult:
+    """One quote's deterministic verification result: whether it was found,
+    verbatim, in the chunk it claims to come from."""
+
+    chunk_id: str
+    quote: str
+    verified: bool
+
+
+@dataclass(frozen=True)
+class AnswerVerification:
+    facts: list[QuoteResult] = field(default_factory=list)
+
+    @property
+    def hallucinated_quotes(self) -> int:
+        return sum(1 for f in self.facts if not f.verified)
+
+    def to_dict(self) -> dict:
+        return {
+            "facts": [asdict(f) for f in self.facts],
+            "hallucinated_quotes": self.hallucinated_quotes,
+        }
+
+
 class Answerer(Role[AnswerOutput]):
     """Facts each carry a quote; check it against the cited chunk's actual
     text rather than trusting the model's own claim."""
@@ -260,61 +237,129 @@ class Answerer(Role[AnswerOutput]):
     SUFFIX = ANSWER_SUFFIX
     Output = AnswerOutput
 
-    def verify(self, output: AnswerOutput, contents: dict[str, str]) -> None:
-        hallucinated = 0
-        for fact in output.facts:
-            fact.quote_verified = quote_in_chunk(
-                fact.quote, contents.get(fact.chunk_id, "")
-            )
-            if not fact.quote_verified:
-                hallucinated += 1
-        output.hallucinated_quotes = hallucinated
+    def verify(
+        self, output: AnswerOutput, contents: dict[str, str]
+    ) -> AnswerVerification:
+        return AnswerVerification(
+            facts=[
+                QuoteResult(
+                    chunk_id=fact.chunk_id,
+                    quote=fact.quote,
+                    verified=quote_in_chunk(
+                        fact.quote, contents.get(fact.chunk_id, "")
+                    ),
+                )
+                for fact in output.facts
+            ]
+        )
+
+
+@dataclass(frozen=True)
+class FactCheckResult:
+    quote: QuoteResult
+    supported: Literal["yes", "partial", "no"]
+    """The Verifier's own verdict, downgraded to "no" here if `quote` did
+    not verify - an unverifiable quote is not trustworthy support."""
+
+
+@dataclass(frozen=True)
+class VerifierVerification:
+    facts: list[FactCheckResult] = field(default_factory=list)
+
+    @property
+    def hallucinated_quotes(self) -> int:
+        return sum(1 for f in self.facts if not f.quote.verified)
+
+    def to_dict(self) -> dict:
+        return {
+            "facts": [asdict(f) for f in self.facts],
+            "hallucinated_quotes": self.hallucinated_quotes,
+        }
 
 
 class Verifier(Role[VerificationOutput]):
     """Each FactCheck's quote is checked the same way; a yes/partial verdict
-    backed by a quote we cannot find is downgraded to "no" - we do not trust
-    the Verifier's own say-so."""
+    backed by a quote we cannot find is downgraded to "no" here - we do not
+    trust the Verifier's own say-so."""
 
     NAME = "verify"
     SUFFIX = VERIFICATION_SUFFIX
     Output = VerificationOutput
 
-    def verify(self, output: VerificationOutput, contents: dict[str, str]) -> None:
-        hallucinated = 0
+    def verify(
+        self, output: VerificationOutput, contents: dict[str, str]
+    ) -> VerifierVerification:
+        results = []
         for check in output.facts:
-            check.quote_verified = quote_in_chunk(
-                check.quote, contents.get(check.chunk_id, "")
+            verified = quote_in_chunk(check.quote, contents.get(check.chunk_id, ""))
+            supported = check.supported if verified else "no"
+            results.append(
+                FactCheckResult(
+                    quote=QuoteResult(check.chunk_id, check.quote, verified),
+                    supported=supported,
+                )
             )
-            if not check.quote_verified:
-                hallucinated += 1
-                if check.supported != "no":
-                    check.supported = "no"
-        output.hallucinated_quotes = hallucinated
+        return VerifierVerification(facts=results)
+
+
+@dataclass(frozen=True)
+class SubQuestionResult:
+    question: str
+    quote: QuoteResult | None
+    """None if the model did not claim coverage for this sub-question."""
+
+    @property
+    def covered(self) -> bool:
+        return self.quote is not None and self.quote.verified
+
+
+@dataclass(frozen=True)
+class CompletenessVerification:
+    subquestions: list[SubQuestionResult] = field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        return all(sq.covered for sq in self.subquestions)
+
+    @property
+    def missing(self) -> list[str]:
+        return [sq.question for sq in self.subquestions if not sq.covered]
+
+    @property
+    def hallucinated_quotes(self) -> int:
+        return sum(1 for sq in self.subquestions if sq.quote and not sq.quote.verified)
+
+    def to_dict(self) -> dict:
+        return {
+            "subquestions": [
+                {**asdict(sq), "covered": sq.covered} for sq in self.subquestions
+            ],
+            "complete": self.complete,
+            "missing": self.missing,
+            "hallucinated_quotes": self.hallucinated_quotes,
+        }
 
 
 class CompletenessChecker(Role[CompletenessOutput]):
     """Each sub-question's coverage claim carries a quote, checked the same
-    way as Fact/FactCheck; complete and missing are derived in code from
+    way as Fact/FactCheck; complete and missing are derived here from
     verified coverage, not the model's own top-line verdict."""
 
     NAME = "completeness"
     SUFFIX = COMPLETENESS_SUFFIX
     Output = CompletenessOutput
 
-    def verify(self, output: CompletenessOutput, contents: dict[str, str]) -> None:
-        hallucinated = 0
+    def verify(
+        self, output: CompletenessOutput, contents: dict[str, str]
+    ) -> CompletenessVerification:
+        results = []
         for sq in output.subquestions:
+            quote = None
             if sq.covered:
-                sq.quote_verified = quote_in_chunk(
-                    sq.quote, contents.get(sq.chunk_id, "")
-                )
-                if not sq.quote_verified:
-                    hallucinated += 1
-                    sq.covered = False
-        output.hallucinated_quotes = hallucinated
-        output.complete = all(sq.covered for sq in output.subquestions)
-        output.missing = [sq.question for sq in output.subquestions if not sq.covered]
+                verified = quote_in_chunk(sq.quote, contents.get(sq.chunk_id, ""))
+                quote = QuoteResult(sq.chunk_id, sq.quote, verified)
+            results.append(SubQuestionResult(question=sq.question, quote=quote))
+        return CompletenessVerification(subquestions=results)
 
 
 def format_query_prefix(question: str) -> str:

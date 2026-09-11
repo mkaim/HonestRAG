@@ -22,9 +22,11 @@ from fusion import RRF
 from llm import (
     Answerer,
     CompletenessChecker,
+    CompletenessVerification,
     Decomposer,
     Role,
     Verifier,
+    VerifierVerification,
     build_agent,
     chunks_by_id,
     format_answer_suffix,
@@ -77,16 +79,19 @@ def _sse(stage: str, status: str, **fields) -> str:
 
 async def _run_role(role: Role, prompt_prefix: str, contents: dict[str, str]) -> tuple:
     result = await role.run(prompt_prefix, contents, debug=cfg.debug)
-    fields = {"data": result.output.model_dump()}
+    data = result.output.model_dump()
+    if result.verification is not None:
+        data["verification"] = result.verification.to_dict()
+    fields = {"data": data}
     if result.raw_messages is not None:
         fields["debug"] = json.loads(result.raw_messages)
-    return result.output, fields
+    return result.output, result.verification, fields
 
 
 async def _ask_stream(question: str) -> AsyncIterator[str]:
     yield _sse("decompose", "running")
     decomposer = Decomposer(agent)
-    decomposition, fields = await _run_role(
+    decomposition, _, fields = await _run_role(
         decomposer, format_query_prefix(question), {}
     )
     yield _sse("decompose", "done", **fields)
@@ -105,17 +110,8 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
                 "answer": "No matching passages found in the corpus.",
                 "questions": decomposition.questions,
                 "facts": [],
-                "verification": {
-                    "facts": [],
-                    "contradictions": [],
-                    "hallucinated_quotes": 0,
-                },
-                "completeness": {
-                    "subquestions": [],
-                    "complete": True,
-                    "missing": [],
-                    "hallucinated_quotes": 0,
-                },
+                "verification": VerifierVerification().to_dict(),
+                "completeness": CompletenessVerification().to_dict(),
             },
         )
         return
@@ -124,13 +120,15 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
     contents = chunks_by_id(chunks)
 
     yield _sse("answer", "running")
-    answer, fields = await _run_role(Answerer(agent), prompt_prefix, contents)
+    answer, answer_verification, fields = await _run_role(
+        Answerer(agent), prompt_prefix, contents
+    )
     yield _sse("answer", "done", **fields)
 
     prompt_prefix += format_answer_suffix(answer)
 
     yield _sse("verify", "running")
-    verification, fields = await _run_role(Verifier(agent), prompt_prefix, contents)
+    _, verification, fields = await _run_role(Verifier(agent), prompt_prefix, contents)
     yield _sse("verify", "done", **fields)
 
     completeness_prefix = prompt_prefix + format_subquestions_suffix(
@@ -138,10 +136,20 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
     )
 
     yield _sse("completeness", "running")
-    completeness, fields = await _run_role(
+    _, completeness, fields = await _run_role(
         CompletenessChecker(agent), completeness_prefix, contents
     )
     yield _sse("completeness", "done", **fields)
+
+    facts = [
+        {
+            "chunk_id": fact.chunk_id,
+            "statement": fact.statement,
+            "quote": fact.quote,
+            "verified": result.verified,
+        }
+        for fact, result in zip(answer.facts, answer_verification.facts, strict=True)
+    ]
 
     yield _sse(
         "final",
@@ -149,9 +157,9 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
         data={
             "answer": answer.answer,
             "questions": decomposition.questions,
-            "facts": [f.model_dump() for f in answer.facts],
-            "verification": verification.model_dump(),
-            "completeness": completeness.model_dump(),
+            "facts": facts,
+            "verification": verification.to_dict(),
+            "completeness": completeness.to_dict(),
         },
     )
 
