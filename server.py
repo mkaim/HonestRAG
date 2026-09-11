@@ -77,24 +77,40 @@ def _sse(stage: str, status: str, **fields) -> str:
     return f"data: {json.dumps({'stage': stage, 'status': status, **fields})}\n\n"
 
 
-async def _run_role(role: Role, prompt_prefix: str, contents: dict[str, str]) -> tuple:
-    result = await role.run(prompt_prefix, contents, debug=cfg.debug)
-    data = result.output.model_dump()
-    if result.verification is not None:
-        data["verification"] = result.verification.to_dict()
-    fields = {"data": data}
-    if result.raw_messages is not None:
-        fields["debug"] = json.loads(result.raw_messages)
-    return result.output, result.verification, fields
+class RoleRunner:
+    """Wraps role.run() as an async-iterable of SSE lines: a 'running' line,
+    then the call, then a 'done' line carrying its output/debug data. Stage
+    name comes from the role itself (role.NAME). Iterate it for the SSE
+    lines; .output/.verification hold the result once the loop finishes."""
+
+    def __init__(self, role: Role, prompt_prefix: str, contents: dict[str, str]):
+        self.role = role
+        self.prompt_prefix = prompt_prefix
+        self.contents = contents
+        self.output = None
+        self.verification = None
+
+    async def __aiter__(self) -> AsyncIterator[str]:
+        yield _sse(self.role.NAME, "running")
+
+        result = await self.role.run(self.prompt_prefix, self.contents, debug=cfg.debug)
+        self.output = result.output
+        self.verification = result.verification
+
+        data = result.output.model_dump()
+        if result.verification is not None:
+            data["verification"] = result.verification.to_dict()
+        fields = {"data": data}
+        if result.raw_messages is not None:
+            fields["debug"] = json.loads(result.raw_messages)
+        yield _sse(self.role.NAME, "done", **fields)
 
 
 async def _ask_stream(question: str) -> AsyncIterator[str]:
-    yield _sse("decompose", "running")
-    decomposer = Decomposer(agent)
-    decomposition, _, fields = await _run_role(
-        decomposer, format_query_prefix(question), {}
-    )
-    yield _sse("decompose", "done", **fields)
+    decomposer = RoleRunner(Decomposer(agent), format_query_prefix(question), {})
+    async for line in decomposer:
+        yield line
+    decomposition = decomposer.output
 
     yield _sse("search", "running")
     results = await rag.search(decomposition.questions)
@@ -119,27 +135,28 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
     prompt_prefix = format_prompt_prefix(question, chunks)
     contents = chunks_by_id(chunks)
 
-    yield _sse("answer", "running")
-    answer, answer_verification, fields = await _run_role(
-        Answerer(agent), prompt_prefix, contents
-    )
-    yield _sse("answer", "done", **fields)
+    answerer = RoleRunner(Answerer(agent), prompt_prefix, contents)
+    async for line in answerer:
+        yield line
+    answer, answer_verification = answerer.output, answerer.verification
 
     prompt_prefix += format_answer_suffix(answer)
 
-    yield _sse("verify", "running")
-    _, verification, fields = await _run_role(Verifier(agent), prompt_prefix, contents)
-    yield _sse("verify", "done", **fields)
+    verifier = RoleRunner(Verifier(agent), prompt_prefix, contents)
+    async for line in verifier:
+        yield line
+    verification = verifier.verification
 
     completeness_prefix = prompt_prefix + format_subquestions_suffix(
         decomposition.questions
     )
 
-    yield _sse("completeness", "running")
-    _, completeness, fields = await _run_role(
+    completeness_checker = RoleRunner(
         CompletenessChecker(agent), completeness_prefix, contents
     )
-    yield _sse("completeness", "done", **fields)
+    async for line in completeness_checker:
+        yield line
+    completeness = completeness_checker.verification
 
     facts = [
         {
