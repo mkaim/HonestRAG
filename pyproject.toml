@@ -11,6 +11,7 @@ dependencies = [
     "pydantic-ai-slim[openai]>=2.42.0",
     "pydantic-settings>=2.15.0",
     "sentence-transformers>=6.0.1",
+    "torch>=2.14.0",
     "uvicorn[standard]>=0.52.4",
 ]
 
@@ -32,3 +33,11 @@ line-length = 88
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
