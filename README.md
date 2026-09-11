@@ -1,8 +1,11 @@
-# rag
+# HonestRAG
 
-A small, self-hosted RAG (retrieval-augmented generation) system: hybrid
-BM25 + semantic search over Postgres/ParadeDB, fused with RRF, answered by
-any OpenAI-compatible LLM (OpenAI, LM Studio, Ollama, etc.).
+A small, self-hosted RAG (retrieval-augmented generation) system built
+around one rule: answer only from the retrieved data, and say so plainly
+when the data doesn't support an answer, instead of guessing.
+
+Hybrid BM25 + semantic search over Postgres/ParadeDB, fused with RRF,
+answered by any OpenAI-compatible LLM (OpenAI, LM Studio, Ollama, etc.).
 
 - **Retrieval**: BM25 (ParadeDB) + semantic (pgvector/HNSW), merged with
   Reciprocal Rank Fusion.
