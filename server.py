@@ -30,6 +30,7 @@ from llm import (
     format_answer_suffix,
     format_prompt_prefix,
     format_query_prefix,
+    format_subquestions_suffix,
 )
 from rag import Rag
 
@@ -109,7 +110,12 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
                     "contradictions": [],
                     "hallucinated_quotes": 0,
                 },
-                "completeness": {"complete": True, "missing": []},
+                "completeness": {
+                    "subquestions": [],
+                    "complete": True,
+                    "missing": [],
+                    "hallucinated_quotes": 0,
+                },
             },
         )
         return
@@ -127,9 +133,13 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
     verification, fields = await _run_role(Verifier(agent), prompt_prefix, contents)
     yield _sse("verify", "done", **fields)
 
+    completeness_prefix = prompt_prefix + format_subquestions_suffix(
+        decomposition.questions
+    )
+
     yield _sse("completeness", "running")
     completeness, fields = await _run_role(
-        CompletenessChecker(agent), prompt_prefix, contents
+        CompletenessChecker(agent), completeness_prefix, contents
     )
     yield _sse("completeness", "done", **fields)
 

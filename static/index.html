@@ -201,7 +201,10 @@
               ).length;
               const verifyHallucinated =
                 event.data.verification.hallucinated_quotes || 0;
-              const total = answerHallucinated + verifyHallucinated;
+              const completenessHallucinated =
+                event.data.completeness.hallucinated_quotes || 0;
+              const total =
+                answerHallucinated + verifyHallucinated + completenessHallucinated;
               risk.hidden = false;
               if (total === 0) {
                 risk.className = "ok";
@@ -210,8 +213,9 @@
                 risk.className = "warn";
                 risk.textContent =
                   `${total} unverifiable quote(s) detected ` +
-                  `(${answerHallucinated} in the answer, ${verifyHallucinated} ` +
-                  `in verification) - treat those facts as unsupported.`;
+                  `(${answerHallucinated} in the answer, ${verifyHallucinated} in ` +
+                  `verification, ${completenessHallucinated} in completeness) - ` +
+                  `treat those claims as unsupported.`;
               }
             } else {
               renderStage(event);

@@ -159,11 +159,54 @@ class VerificationOutput(BaseModel):
     )
 
 
+class SubQuestionCoverage(BaseModel):
+    question: str = Field(description="exact copy of the sub-question checked")
+    covered: bool = Field(
+        description="whether the answer actually addresses this sub-question"
+    )
+    chunk_id: str = Field(
+        default="",
+        description=("id of the chunk backing coverage, empty if covered is false"),
+    )
+    quote: str = Field(
+        default="",
+        description=(
+            "verbatim span from that chunk backing coverage, empty if covered is false"
+        ),
+    )
+    quote_verified: bool = Field(
+        default=False,
+        description=(
+            "set by us, not the model: whether `quote` was deterministically "
+            "found in the cited chunk"
+        ),
+    )
+
+
 class CompletenessOutput(BaseModel):
-    complete: bool
+    subquestions: list[SubQuestionCoverage] = Field(
+        description="coverage of each sub-question the answer was built from"
+    )
+    complete: bool = Field(
+        default=False,
+        description=(
+            "set by us, not the model: true iff every sub-question is "
+            "covered with a verified quote"
+        ),
+    )
     missing: list[str] = Field(
         default_factory=list,
-        description="important info the data has that the answer omitted",
+        description=(
+            "set by us, not the model: the question text of every "
+            "uncovered sub-question"
+        ),
+    )
+    hallucinated_quotes: int = Field(
+        default=0,
+        description=(
+            "set by us, not the model: how many sub-questions claimed "
+            "covered with a quote we could not find in the cited chunk"
+        ),
     )
 
 
@@ -195,9 +238,11 @@ VERIFICATION_SUFFIX = (
 )
 
 COMPLETENESS_SUFFIX = (
-    "\n\nCompare the answer above against all the retrieved context. Is it "
-    "complete? List any important information the context contains that the "
-    "answer omitted."
+    "\n\nFor each sub-question listed above, decide whether the answer "
+    "actually addresses it. If covered, cite the id of the single chunk "
+    "backing that coverage plus a verbatim quote copied exactly from that "
+    "chunk - do not paraphrase or alter it. If not covered, leave chunk_id "
+    "and quote empty."
 )
 
 
@@ -249,9 +294,27 @@ class Verifier(Role[VerificationOutput]):
 
 
 class CompletenessChecker(Role[CompletenessOutput]):
+    """Each sub-question's coverage claim carries a quote, checked the same
+    way as Fact/FactCheck; complete and missing are derived in code from
+    verified coverage, not the model's own top-line verdict."""
+
     NAME = "completeness"
     SUFFIX = COMPLETENESS_SUFFIX
     Output = CompletenessOutput
+
+    def verify(self, output: CompletenessOutput, contents: dict[str, str]) -> None:
+        hallucinated = 0
+        for sq in output.subquestions:
+            if sq.covered:
+                sq.quote_verified = quote_in_chunk(
+                    sq.quote, contents.get(sq.chunk_id, "")
+                )
+                if not sq.quote_verified:
+                    hallucinated += 1
+                    sq.covered = False
+        output.hallucinated_quotes = hallucinated
+        output.complete = all(sq.covered for sq in output.subquestions)
+        output.missing = [sq.question for sq in output.subquestions if not sq.covered]
 
 
 def format_query_prefix(question: str) -> str:
@@ -264,6 +327,10 @@ def format_prompt_prefix(question: str, chunks: list[SearchResult]) -> str:
 
 def format_answer_suffix(answer: AnswerOutput) -> str:
     return f"\n\nAnswer:\n{answer.model_dump_json()}"
+
+
+def format_subquestions_suffix(questions: list[str]) -> str:
+    return f"\n\nSub-questions:\n{json.dumps(questions)}"
 
 
 def chunks_by_id(chunks: list[SearchResult]) -> dict[str, str]:
