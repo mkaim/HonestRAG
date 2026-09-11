@@ -30,8 +30,6 @@ from llm import (
     format_answer_suffix,
     format_prompt_prefix,
     format_query_prefix,
-    verify_answer_quotes,
-    verify_verification_quotes,
 )
 from rag import Rag
 
@@ -76,10 +74,8 @@ def _sse(stage: str, status: str, **fields) -> str:
     return f"data: {json.dumps({'stage': stage, 'status': status, **fields})}\n\n"
 
 
-async def _run_role(role: Role, prompt_prefix: str, *, after=None) -> tuple:
-    result = await role.run(prompt_prefix, debug=cfg.debug)
-    if after is not None:
-        after(result.output)
+async def _run_role(role: Role, prompt_prefix: str, contents: dict[str, str]) -> tuple:
+    result = await role.run(prompt_prefix, contents, debug=cfg.debug)
     fields = {"data": result.output.model_dump()}
     if result.raw_messages is not None:
         fields["debug"] = json.loads(result.raw_messages)
@@ -89,7 +85,9 @@ async def _run_role(role: Role, prompt_prefix: str, *, after=None) -> tuple:
 async def _ask_stream(question: str) -> AsyncIterator[str]:
     yield _sse("decompose", "running")
     decomposer = Decomposer(agent)
-    decomposition, fields = await _run_role(decomposer, format_query_prefix(question))
+    decomposition, fields = await _run_role(
+        decomposer, format_query_prefix(question), {}
+    )
     yield _sse("decompose", "done", **fields)
 
     yield _sse("search", "running")
@@ -120,25 +118,19 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
     contents = chunks_by_id(chunks)
 
     yield _sse("answer", "running")
-    answer, fields = await _run_role(
-        Answerer(agent),
-        prompt_prefix,
-        after=lambda output: verify_answer_quotes(output, contents),
-    )
+    answer, fields = await _run_role(Answerer(agent), prompt_prefix, contents)
     yield _sse("answer", "done", **fields)
 
     prompt_prefix += format_answer_suffix(answer)
 
     yield _sse("verify", "running")
-    verification, fields = await _run_role(
-        Verifier(agent),
-        prompt_prefix,
-        after=lambda output: verify_verification_quotes(output, contents),
-    )
+    verification, fields = await _run_role(Verifier(agent), prompt_prefix, contents)
     yield _sse("verify", "done", **fields)
 
     yield _sse("completeness", "running")
-    completeness, fields = await _run_role(CompletenessChecker(agent), prompt_prefix)
+    completeness, fields = await _run_role(
+        CompletenessChecker(agent), prompt_prefix, contents
+    )
     yield _sse("completeness", "done", **fields)
 
     yield _sse(

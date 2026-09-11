@@ -72,9 +72,21 @@ class Role[T: BaseModel]:
     def __init__(self, agent: Agent):
         self.agent = agent
 
-    async def run(self, prompt_prefix: str, *, debug: bool = False) -> RoleResult[T]:
+    def verify(self, output: T, contents: dict[str, str]) -> None:
+        """Deterministic, code-level check applied to `output` in place after
+        the model call, given each cited chunk_id's actual content. No-op by
+        default; roles that produce quotes override this."""
+
+    async def run(
+        self,
+        prompt_prefix: str,
+        contents: dict[str, str],
+        *,
+        debug: bool = False,
+    ) -> RoleResult[T]:
         prompt = prompt_prefix + self.SUFFIX
         result = await self.agent.run(prompt, output_type=self.Output)
+        self.verify(result.output, contents)
         raw_messages = result.new_messages_json().decode() if debug else None
         return RoleResult(output=result.output, raw_messages=raw_messages)
 
@@ -196,15 +208,44 @@ class Decomposer(Role[DecomposeOutput]):
 
 
 class Answerer(Role[AnswerOutput]):
+    """Facts each carry a quote; check it against the cited chunk's actual
+    text rather than trusting the model's own claim."""
+
     NAME = "answer"
     SUFFIX = ANSWER_SUFFIX
     Output = AnswerOutput
 
+    def verify(self, output: AnswerOutput, contents: dict[str, str]) -> None:
+        hallucinated = 0
+        for fact in output.facts:
+            fact.quote_verified = quote_in_chunk(
+                fact.quote, contents.get(fact.chunk_id, "")
+            )
+            if not fact.quote_verified:
+                hallucinated += 1
+        output.hallucinated_quotes = hallucinated
+
 
 class Verifier(Role[VerificationOutput]):
+    """Each FactCheck's quote is checked the same way; a yes/partial verdict
+    backed by a quote we cannot find is downgraded to "no" - we do not trust
+    the Verifier's own say-so."""
+
     NAME = "verify"
     SUFFIX = VERIFICATION_SUFFIX
     Output = VerificationOutput
+
+    def verify(self, output: VerificationOutput, contents: dict[str, str]) -> None:
+        hallucinated = 0
+        for check in output.facts:
+            check.quote_verified = quote_in_chunk(
+                check.quote, contents.get(check.chunk_id, "")
+            )
+            if not check.quote_verified:
+                hallucinated += 1
+                if check.supported != "no":
+                    check.supported = "no"
+        output.hallucinated_quotes = hallucinated
 
 
 class CompletenessChecker(Role[CompletenessOutput]):
@@ -227,35 +268,3 @@ def format_answer_suffix(answer: AnswerOutput) -> str:
 
 def chunks_by_id(chunks: list[SearchResult]) -> dict[str, str]:
     return {r.chunk.id: r.chunk.content for r in chunks}
-
-
-def verify_answer_quotes(answer: AnswerOutput, contents: dict[str, str]) -> None:
-    """Deterministically check each fact's quote against its cited chunk's
-    actual text, in place. This is the ground truth check on the Answerer's
-    own claims, run before the Verifier ever sees them."""
-    hallucinated = 0
-    for fact in answer.facts:
-        fact.quote_verified = quote_in_chunk(
-            fact.quote, contents.get(fact.chunk_id, "")
-        )
-        if not fact.quote_verified:
-            hallucinated += 1
-    answer.hallucinated_quotes = hallucinated
-
-
-def verify_verification_quotes(
-    verification: VerificationOutput, contents: dict[str, str]
-) -> None:
-    """Deterministically check each FactCheck's quote against its cited
-    chunk, in place. A yes/partial verdict backed by a quote we cannot find
-    is downgraded to "no" - we do not trust the Verifier's own say-so."""
-    hallucinated = 0
-    for check in verification.facts:
-        check.quote_verified = quote_in_chunk(
-            check.quote, contents.get(check.chunk_id, "")
-        )
-        if not check.quote_verified:
-            hallucinated += 1
-            if check.supported != "no":
-                check.supported = "no"
-    verification.hallucinated_quotes = hallucinated
