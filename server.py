@@ -22,14 +22,19 @@ from rag import Rag
 
 TOP_K = 10
 
+cfg = Settings()
+agent = build_agent(cfg.llm_base_url, cfg.llm_api_key, cfg.llm_model)
+
+embedder = SenTranEmbedder(cfg.embed_model)
+db = PsqlRagDb(cfg.dsn, embedder)
+rag = Rag(db, RRF(), rf_limit=TOP_K)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cfg = Settings()
-    embedder = SenTranEmbedder(cfg.embed_model)
-    async with PsqlRagDb(cfg.dsn, embedder) as db:
-        app.state.rag = Rag(db, RRF(), rf_limit=TOP_K)
-        app.state.agent = build_agent(cfg.llm_base_url, cfg.llm_api_key, cfg.llm_model)
+    # Opens db's connection pool once the event loop is running, and closes
+    # it on shutdown. Everything else above is plain sync construction.
+    async with db:
         yield
 
 
@@ -52,9 +57,9 @@ async def index() -> FileResponse:
 
 @app.post("/api/ask")
 async def ask(req: AskRequest) -> AskResponse:
-    [passages] = await app.state.rag.search([req.question])
+    [passages] = await rag.search([req.question])
     if not passages:
         return AskResponse(answer="No matching passages found in the corpus.")
 
-    result = await answer(app.state.agent, req.question, passages)
+    result = await answer(agent, req.question, passages)
     return AskResponse(answer=result.text)
