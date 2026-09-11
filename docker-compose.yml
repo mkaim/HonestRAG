@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: paradedb/paradedb:pg18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-rag}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./postgres_init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  web:
+    build: .
+    ports:
+      - "${WEB_PORT:-8000}:8000"
+    environment:
+      RAG_DSN: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-rag}
+      RAG_EMBED_MODEL: ${RAG_EMBED_MODEL}
+      RAG_LLM_BASE_URL: ${RAG_LLM_BASE_URL}
+      RAG_LLM_API_KEY: ${RAG_LLM_API_KEY}
+      RAG_LLM_MODEL: ${RAG_LLM_MODEL}
+    extra_hosts:
+      - "${RAG_LLM_HOST:-localhost}:${RAG_LLM_HOST_IP:-127.0.0.1}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
