@@ -32,7 +32,6 @@ from llm import (
     format_answer_suffix,
     format_prompt_prefix,
     format_query_prefix,
-    format_subquestions_suffix,
 )
 from rag import Rag
 
@@ -116,7 +115,14 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
     results = await rag.search(decomposition.questions)
     by_chunk_id = {r.chunk.id: r for per_query in results for r in per_query}
     chunks = list(by_chunk_id.values())
-    yield _sse("search", "done", data={"chunk_count": len(chunks)})
+    search_fields = {"data": {"chunk_count": len(chunks)}}
+    if cfg.debug:
+        search_fields["debug"] = {
+            "chunks": [
+                {"chunk_id": r.chunk.id, "content": r.chunk.content} for r in chunks
+            ]
+        }
+    yield _sse("search", "done", **search_fields)
 
     if not chunks:
         yield _sse(
@@ -125,14 +131,26 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
             data={
                 "answer": "No matching passages found in the corpus.",
                 "questions": decomposition.questions,
-                "facts": [],
+                "subanswers": [],
                 "verification": VerifierVerification().to_dict(),
                 "completeness": CompletenessVerification().to_dict(),
+                "stats": {
+                    "total_facts": 0,
+                    "answer_quotes_verified": 0,
+                    "verifier_fully_supported": 0,
+                    "verifier_partially_supported": 0,
+                    "verifier_unsupported": 0,
+                    "verifier_hallucinated_quotes": 0,
+                    "verifier_no_claims": 0,
+                    "subquestions_covered": 0,
+                    "subquestions_total": 0,
+                    "complete": False,
+                },
             },
         )
         return
 
-    prompt_prefix = format_prompt_prefix(question, chunks)
+    prompt_prefix = format_prompt_prefix(question, chunks, decomposition.questions)
     contents = chunks_by_id(chunks)
 
     answerer = RoleRunner(Answerer(agent), prompt_prefix, contents)
@@ -147,26 +165,50 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
         yield line
     verification = verifier.verification
 
-    completeness_prefix = prompt_prefix + format_subquestions_suffix(
-        decomposition.questions
-    )
-
     completeness_checker = RoleRunner(
-        CompletenessChecker(agent), completeness_prefix, contents
+        CompletenessChecker(agent), prompt_prefix, contents
     )
     async for line in completeness_checker:
         yield line
     completeness = completeness_checker.verification
 
-    facts = [
+    subanswers = [
         {
-            "chunk_id": fact.chunk_id,
-            "statement": fact.statement,
-            "quote": fact.quote,
-            "verified": result.verified,
+            "question": sub.question,
+            "answer": sub.answer,
+            "facts": [
+                {
+                    "chunk_id": fact.chunk_id,
+                    "statement": fact.statement,
+                    "quote": fact.quote,
+                    "verified": result.verified,
+                }
+                for fact, result in zip(sub.facts, sub_verification.facts, strict=True)
+            ],
         }
-        for fact, result in zip(answer.facts, answer_verification.facts, strict=True)
+        for sub, sub_verification in zip(
+            answer.subanswers, answer_verification.subanswers, strict=True
+        )
     ]
+
+    total_facts = sum(len(sub["facts"]) for sub in subanswers)
+    answer_verified_quotes = sum(
+        1 for sub in subanswers for fact in sub["facts"] if fact["verified"]
+    )
+    stats = {
+        "total_facts": total_facts,
+        "answer_quotes_verified": answer_verified_quotes,
+        "verifier_fully_supported": verification.fully_supported,
+        "verifier_partially_supported": verification.partially_supported,
+        "verifier_unsupported": verification.unsupported,
+        "verifier_hallucinated_quotes": verification.hallucinated_quotes,
+        "verifier_no_claims": verification.no_claims,
+        "subquestions_covered": (
+            len(completeness.subquestions) - len(completeness.missing)
+        ),
+        "subquestions_total": len(completeness.subquestions),
+        "complete": completeness.complete,
+    }
 
     yield _sse(
         "final",
@@ -174,9 +216,10 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
         data={
             "answer": answer.answer,
             "questions": decomposition.questions,
-            "facts": facts,
+            "subanswers": subanswers,
             "verification": verification.to_dict(),
             "completeness": completeness.to_dict(),
+            "stats": stats,
         },
     )
 

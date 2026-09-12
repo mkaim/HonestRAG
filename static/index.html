@@ -83,6 +83,17 @@
     #extras pre {
       white-space: pre-wrap;
     }
+    #stats {
+      margin-top: 0.75rem;
+      font-size: 0.85rem;
+      color: #444;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem 1rem;
+    }
+    #stats span {
+      white-space: nowrap;
+    }
   </style>
 </head>
 <body>
@@ -94,6 +105,7 @@
   <div id="stages"></div>
   <div id="risk" hidden></div>
   <div id="answer"></div>
+  <div id="stats" hidden></div>
   <details id="extras" hidden>
     <summary>Facts, verification &amp; completeness</summary>
     <pre id="extras-body"></pre>
@@ -108,6 +120,7 @@
     const extras = document.getElementById("extras");
     const extrasBody = document.getElementById("extras-body");
     const risk = document.getElementById("risk");
+    const stats = document.getElementById("stats");
 
     const STAGE_LABELS = {
       decompose: "Decomposing question",
@@ -156,6 +169,8 @@
       answer.textContent = "";
       extras.hidden = true;
       risk.hidden = true;
+      stats.hidden = true;
+      stats.innerHTML = "";
 
       try {
         const res = await fetch("/api/ask", {
@@ -184,21 +199,36 @@
 
             if (event.stage === "final") {
               answer.textContent = event.data.answer;
+
+              const s = event.data.stats;
+              if (s) {
+                stats.hidden = false;
+                stats.innerHTML = [
+                  `<span>Quotes verified: ${s.answer_quotes_verified}/${s.total_facts}</span>`,
+                  `<span>Verifier: ${s.verifier_fully_supported} yes, ` +
+                    `${s.verifier_partially_supported} partial, ` +
+                    `${s.verifier_unsupported} no, ` +
+                    `${s.verifier_no_claims} declined</span>`,
+                  `<span>Sub-questions covered: ${s.subquestions_covered}/${s.subquestions_total}</span>`,
+                ].join("");
+              }
+
               extrasBody.textContent = JSON.stringify(
                 {
                   questions: event.data.questions,
-                  facts: event.data.facts,
+                  subanswers: event.data.subanswers,
                   verification: event.data.verification,
                   completeness: event.data.completeness,
+                  stats: event.data.stats,
                 },
                 null,
                 2,
               );
               extras.hidden = false;
 
-              const answerHallucinated = event.data.facts.filter(
-                (f) => !f.verified,
-              ).length;
+              const answerHallucinated = event.data.subanswers
+                .flatMap((sa) => sa.facts)
+                .filter((f) => !f.verified).length;
               const verifyHallucinated =
                 event.data.verification.hallucinated_quotes || 0;
               const completenessHallucinated =

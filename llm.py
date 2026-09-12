@@ -38,6 +38,12 @@ def quote_in_chunk(quote: str, chunk_content: str) -> bool:
     return normalized_quote in _normalize(chunk_content)
 
 
+def _chunk_content(chunk_id: str, contents: dict[str, str]) -> str:
+    """Looks up chunk_id in contents, tolerant of the model echoing it back
+    wrapped in the "[chunk_id]" brackets used in the context we show it."""
+    return contents.get(chunk_id, contents.get(chunk_id.strip("[]"), ""))
+
+
 def build_agent(
     base_url: str,
     api_key: str,
@@ -113,11 +119,21 @@ class Fact(BaseModel):
     quote: str = Field(description="verbatim span from that chunk backing this fact")
 
 
-class AnswerOutput(BaseModel):
+class SubAnswer(BaseModel):
+    question: str = Field(description="exact copy of the sub-question answered")
     facts: list[Fact] = Field(
-        description="atomic facts backing the answer; empty if none apply"
+        description="atomic facts backing this sub-answer; empty if none apply"
     )
-    answer: str = Field(description="the synthesized, user-facing answer")
+    answer: str = Field(description="the answer to just this sub-question")
+
+
+class AnswerOutput(BaseModel):
+    subanswers: list[SubAnswer] = Field(
+        description="one answer per sub-question listed above"
+    )
+    answer: str = Field(
+        description="the final, user-facing answer synthesized from the subanswers"
+    )
 
 
 class FactCheck(BaseModel):
@@ -133,9 +149,13 @@ class FactCheck(BaseModel):
 
 class VerificationOutput(BaseModel):
     facts: list[FactCheck]
-    contradictions: list[str] = Field(
+    unsupported_claims: list[str] = Field(
         default_factory=list,
-        description="answer claims that conflict with the data",
+        description=(
+            "sentences in the final answer not entailed by any fact above - "
+            "whether they contradict the data or simply add something no "
+            "fact supports"
+        ),
     )
 
 
@@ -169,24 +189,30 @@ DECOMPOSE_SUFFIX = (
 )
 
 ANSWER_SUFFIX = (
-    "\n\nUsing only the context passages above, list the atomic facts that "
-    "support an answer, each citing the id of the single chunk it came from "
-    "plus a verbatim quote copied exactly from that chunk backing it - do "
-    "not paraphrase or alter the quote in any way. Then write the final "
-    "answer from those facts alone - the answer must not say anything its "
-    "facts don't already say. Never state that a source does not mention, "
-    "cover, or attribute something merely because no fact says it - only "
-    "state an absence if a fact explicitly says the source denies or rules "
-    "it out. If the context does not support an answer, say so plainly and "
-    "leave facts empty."
+    "\n\nUsing only the context passages above, answer each sub-question "
+    "listed above in turn. For each one, list the atomic facts that support "
+    "its answer, each citing the id of the single chunk it came from plus a "
+    "verbatim quote copied exactly from that chunk backing it - do not "
+    "paraphrase or alter the quote in any way - then write that "
+    "sub-question's own answer from those facts alone. Never state that a "
+    "source does not mention, cover, or attribute something merely because "
+    "no fact says it - only state an absence if a fact explicitly says the "
+    "source denies or rules it out. If the context does not support an "
+    "answer to a sub-question, say so plainly and leave its facts empty. "
+    "Finally, write one final answer synthesizing all the sub-answers - it "
+    "must not say anything the sub-answers don't already say."
 )
 
 VERIFICATION_SUFFIX = (
-    "\n\nFor each fact in the answer above, check it against the chunk it "
-    "cited: mark it 'yes' if the chunk fully supports it, 'partial' if only "
-    "partly, 'no' if unsupported, and quote the verbatim span backing it (or "
-    "quote empty if unsupported). List separately any claims in the answer "
-    "text that contradict the retrieved data."
+    "\n\nFor each fact in the answer above, judge whether its quote actually "
+    "entails its statement - not just whether the quote is topically "
+    "related, but whether a careful reader would agree the quote proves the "
+    "statement true. Mark it 'yes' if the quote fully entails the "
+    "statement, 'partial' if it only partly supports it, 'no' if it does "
+    "not entail it at all, and copy the verbatim span you judged against "
+    "(or leave quote empty if 'no'). Separately, list any sentence in the "
+    "final answer that is not entailed by any fact above - whether it "
+    "contradicts the data or simply adds something no fact supports."
 )
 
 COMPLETENESS_SUFFIX = (
@@ -215,16 +241,33 @@ class QuoteResult:
 
 
 @dataclass(frozen=True)
-class AnswerVerification:
+class SubAnswerVerification:
+    question: str
     facts: list[QuoteResult] = field(default_factory=list)
 
     @property
     def hallucinated_quotes(self) -> int:
         return sum(1 for f in self.facts if not f.verified)
 
+
+@dataclass(frozen=True)
+class AnswerVerification:
+    subanswers: list[SubAnswerVerification] = field(default_factory=list)
+
+    @property
+    def hallucinated_quotes(self) -> int:
+        return sum(sa.hallucinated_quotes for sa in self.subanswers)
+
     def to_dict(self) -> dict:
         return {
-            "facts": [asdict(f) for f in self.facts],
+            "subanswers": [
+                {
+                    "question": sa.question,
+                    "facts": [asdict(f) for f in sa.facts],
+                    "hallucinated_quotes": sa.hallucinated_quotes,
+                }
+                for sa in self.subanswers
+            ],
             "hallucinated_quotes": self.hallucinated_quotes,
         }
 
@@ -241,15 +284,21 @@ class Answerer(Role[AnswerOutput]):
         self, output: AnswerOutput, contents: dict[str, str]
     ) -> AnswerVerification:
         return AnswerVerification(
-            facts=[
-                QuoteResult(
-                    chunk_id=fact.chunk_id,
-                    quote=fact.quote,
-                    verified=quote_in_chunk(
-                        fact.quote, contents.get(fact.chunk_id, "")
-                    ),
+            subanswers=[
+                SubAnswerVerification(
+                    question=sub.question,
+                    facts=[
+                        QuoteResult(
+                            chunk_id=fact.chunk_id,
+                            quote=fact.quote,
+                            verified=quote_in_chunk(
+                                fact.quote, _chunk_content(fact.chunk_id, contents)
+                            ),
+                        )
+                        for fact in sub.facts
+                    ],
                 )
-                for fact in output.facts
+                for sub in output.subanswers
             ]
         )
 
@@ -261,6 +310,13 @@ class FactCheckResult:
     """The Verifier's own verdict, downgraded to "no" here if `quote` did
     not verify - an unverifiable quote is not trustworthy support."""
 
+    @property
+    def no_claim(self) -> bool:
+        """True when there was no quote to check at all - e.g. a fact for a
+        sub-question the Answerer correctly declined to answer. Not a
+        hallucination or an unsupported claim; nothing was claimed."""
+        return not self.quote.chunk_id and not self.quote.quote
+
 
 @dataclass(frozen=True)
 class VerifierVerification:
@@ -268,12 +324,32 @@ class VerifierVerification:
 
     @property
     def hallucinated_quotes(self) -> int:
-        return sum(1 for f in self.facts if not f.quote.verified)
+        return sum(1 for f in self.facts if not f.no_claim and not f.quote.verified)
+
+    @property
+    def fully_supported(self) -> int:
+        return sum(1 for f in self.facts if f.supported == "yes")
+
+    @property
+    def partially_supported(self) -> int:
+        return sum(1 for f in self.facts if f.supported == "partial")
+
+    @property
+    def unsupported(self) -> int:
+        return sum(1 for f in self.facts if not f.no_claim and f.supported == "no")
+
+    @property
+    def no_claims(self) -> int:
+        return sum(1 for f in self.facts if f.no_claim)
 
     def to_dict(self) -> dict:
         return {
-            "facts": [asdict(f) for f in self.facts],
+            "facts": [{**asdict(f), "no_claim": f.no_claim} for f in self.facts],
             "hallucinated_quotes": self.hallucinated_quotes,
+            "fully_supported": self.fully_supported,
+            "partially_supported": self.partially_supported,
+            "unsupported": self.unsupported,
+            "no_claims": self.no_claims,
         }
 
 
@@ -291,7 +367,8 @@ class Verifier(Role[VerificationOutput]):
     ) -> VerifierVerification:
         results = []
         for check in output.facts:
-            verified = quote_in_chunk(check.quote, contents.get(check.chunk_id, ""))
+            chunk_content = _chunk_content(check.chunk_id, contents)
+            verified = quote_in_chunk(check.quote, chunk_content)
             supported = check.supported if verified else "no"
             results.append(
                 FactCheckResult(
@@ -356,7 +433,8 @@ class CompletenessChecker(Role[CompletenessOutput]):
         for sq in output.subquestions:
             quote = None
             if sq.covered:
-                verified = quote_in_chunk(sq.quote, contents.get(sq.chunk_id, ""))
+                chunk_content = _chunk_content(sq.chunk_id, contents)
+                verified = quote_in_chunk(sq.quote, chunk_content)
                 quote = QuoteResult(sq.chunk_id, sq.quote, verified)
             results.append(SubQuestionResult(question=sq.question, quote=quote))
         return CompletenessVerification(subquestions=results)
@@ -366,8 +444,14 @@ def format_query_prefix(question: str) -> str:
     return f"Question: {json.dumps(question)}"
 
 
-def format_prompt_prefix(question: str, chunks: list[SearchResult]) -> str:
-    return f"Context:\n{_format_context(chunks)}\n\nQuestion: {json.dumps(question)}"
+def format_prompt_prefix(
+    question: str, chunks: list[SearchResult], questions: list[str]
+) -> str:
+    return (
+        f"Context:\n{_format_context(chunks)}\n\n"
+        f"Question: {json.dumps(question)}"
+        f"{format_subquestions_suffix(questions)}"
+    )
 
 
 def format_answer_suffix(answer: AnswerOutput) -> str:

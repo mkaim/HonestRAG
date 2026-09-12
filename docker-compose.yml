@@ -26,6 +26,7 @@ services:
       RAG_LLM_BASE_URL: ${RAG_LLM_BASE_URL}
       RAG_LLM_API_KEY: ${RAG_LLM_API_KEY}
       RAG_LLM_MODEL: ${RAG_LLM_MODEL}
+      RAG_DEBUG: ${RAG_DEBUG:-false}
     extra_hosts:
       - "${RAG_LLM_HOST:-localhost}:${RAG_LLM_HOST_IP:-127.0.0.1}"
     depends_on:
