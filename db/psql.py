@@ -166,4 +166,5 @@ class PsqlRagDb(RagDb):
         model = self.embedder.model.rsplit("/", 1)[-1]
         name = f"{model}_{self.embedder.dims}".lower()
         name = re.sub(r"[^a-z0-9_]+", "_", name)
-        return re.sub(r"_+", "_", name).strip("_")
+        name = re.sub(r"_+", "_", name).strip("_")
+        return name[:63]  # max table name limit
