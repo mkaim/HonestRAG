@@ -19,17 +19,53 @@ LIMIT %(limit)s
 """
 
 
-def _semantic_sql(embed_table: str) -> str:
-    # embed_table is derived from the model name, not user input; safe to interpolate.
-    return f"""
-    SELECT doc.external_id, c.chunk_index, c.text, c.metadata,
-           -(e.embedding <#> %(embedding)s) AS score
-    FROM {embed_table} e
-    JOIN chunk c ON c.id = e.chunk_id
-    JOIN document doc ON doc.id = c.document_id
-    ORDER BY e.embedding <#> %(embedding)s
-    LIMIT %(limit)s
-    """
+_SEMANTIC_SQL = """
+SELECT doc.external_id, c.chunk_index, c.text, c.metadata,
+        -(e.embedding <#> %(embedding)s) AS score
+FROM {embed_table} e
+JOIN chunk c ON c.id = e.chunk_id
+JOIN document doc ON doc.id = c.document_id
+ORDER BY e.embedding <#> %(embedding)s
+LIMIT %(limit)s
+"""
+
+# Placeholders ({table}, {dims}, {embed_table}) are derived from the embedder
+# model name/dims, never user input, so .format() interpolation is safe.
+_DOCUMENT_UPSERT_SQL = """
+INSERT INTO document (external_id, metadata)
+VALUES (%s, %s)
+ON CONFLICT (external_id)
+DO UPDATE SET metadata = EXCLUDED.metadata
+RETURNING id
+"""
+
+_CHUNK_UPSERT_SQL = """
+INSERT INTO chunk (external_id, document_id, chunk_index, text, metadata)
+VALUES (%s, %s, %s, %s, %s)
+ON CONFLICT (external_id)
+DO UPDATE SET text = EXCLUDED.text, metadata = EXCLUDED.metadata
+RETURNING id
+"""
+
+_CREATE_VECTOR_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS {table} (
+    chunk_id BIGINT PRIMARY KEY
+        REFERENCES chunk(id) ON DELETE CASCADE,
+    embedding vector({dims}) NOT NULL
+)
+"""
+
+_CREATE_VECTOR_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS {table}_hnsw_idx
+    ON {table} USING hnsw (embedding vector_ip_ops)
+"""
+
+_EMBEDDING_UPSERT_SQL = """
+INSERT INTO {table} (chunk_id, embedding)
+VALUES (%s, %s)
+ON CONFLICT (chunk_id)
+DO UPDATE SET embedding = EXCLUDED.embedding
+"""
 
 
 class PsqlRagDb(RagDb):
@@ -52,20 +88,9 @@ class PsqlRagDb(RagDb):
         table = self._vector_table_name()
         async with self.pool.connection() as conn:
             await conn.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {table} (
-                    chunk_id BIGINT PRIMARY KEY
-                        REFERENCES chunk(id) ON DELETE CASCADE,
-                    embedding vector({self.embedder.dims}) NOT NULL
-                )
-                """
+                _CREATE_VECTOR_TABLE_SQL.format(table=table, dims=self.embedder.dims)
             )
-            await conn.execute(
-                f"""
-                CREATE INDEX IF NOT EXISTS {table}_hnsw_idx
-                    ON {table} USING hnsw (embedding vector_ip_ops)
-                """
-            )
+            await conn.execute(_CREATE_VECTOR_INDEX_SQL.format(table=table))
         return table
 
     async def add(self, document: Document, chunks: list[Chunk]) -> None:
@@ -75,27 +100,14 @@ class PsqlRagDb(RagDb):
         table = await self.ensure_vector_table()
         async with self.pool.connection() as conn:
             cur = await conn.execute(
-                """
-                INSERT INTO document (external_id, metadata)
-                VALUES (%s, %s)
-                ON CONFLICT (external_id)
-                DO UPDATE SET metadata = EXCLUDED.metadata
-                RETURNING id
-                """,
+                _DOCUMENT_UPSERT_SQL,
                 (document.id, Jsonb(document.metadata)),
             )
             (document_row_id,) = await cur.fetchone()
 
             for chunk, embedding in zip(chunks, embeddings, strict=True):
                 cur = await conn.execute(
-                    """
-                    INSERT INTO chunk
-                        (external_id, document_id, chunk_index, text, metadata)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (external_id)
-                    DO UPDATE SET text = EXCLUDED.text, metadata = EXCLUDED.metadata
-                    RETURNING id
-                    """,
+                    _CHUNK_UPSERT_SQL,
                     (
                         chunk.id,
                         document_row_id,
@@ -106,12 +118,7 @@ class PsqlRagDb(RagDb):
                 )
                 (chunk_row_id,) = await cur.fetchone()
                 await conn.execute(
-                    f"""
-                    INSERT INTO {table} (chunk_id, embedding)
-                    VALUES (%s, %s)
-                    ON CONFLICT (chunk_id)
-                    DO UPDATE SET embedding = EXCLUDED.embedding
-                    """,
+                    _EMBEDDING_UPSERT_SQL.format(table=table),
                     (chunk_row_id, Vector(embedding)),
                 )
 
@@ -138,7 +145,7 @@ class PsqlRagDb(RagDb):
     async def _search_semantic(
         self, embedding: list[float], limit: int
     ) -> list[SearchResult]:
-        sql = _semantic_sql(self._vector_table_name())
+        sql = _SEMANTIC_SQL.format(embed_table=self._vector_table_name())
         rows = await self._fetch(sql, {"embedding": Vector(embedding), "limit": limit})
         return self._to_results(rows, SearchMode.SEMANTIC)
 

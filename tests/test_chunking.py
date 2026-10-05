@@ -20,6 +20,14 @@ def test_chunk_covers_whole_document_with_overlap():
     assert reconstructed == text
 
 
+def test_chunk_does_not_emit_redundant_tail():
+    text = "0123456789" * 25  # 250 chars
+    chunks = list(FixedSizeChunker(size=100, overlap=20).chunk("doc1", text))
+
+    assert len(chunks) == 3
+    assert chunks[-1].content == text[160:]
+
+
 def test_chunk_short_document_is_a_single_chunk():
     chunks = list(FixedSizeChunker(size=1000, overlap=100).chunk("doc1", "short text"))
 

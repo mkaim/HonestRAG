@@ -16,12 +16,9 @@ class FixedSizeChunker(Chunker):
     def chunk(self, document_id: DocumentID, text: str) -> Iterator[Chunk]:
         step = self.size - self.overlap
 
-        index = 0
-        for start in range(0, max(len(text), 1), step):
+        for index, start in enumerate(range(0, len(text), step)):
             piece = text[start : start + self.size]
-            if not piece:
-                break
             yield Chunk(document_id=document_id, index=index, content=piece)
-            index += 1
+            # Stop once the window reaches the end, avoiding a redundant tail.
             if start + self.size >= len(text):
                 break

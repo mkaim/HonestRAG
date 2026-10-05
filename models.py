@@ -1,4 +1,4 @@
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
@@ -46,17 +46,22 @@ class Chunk:
 class SearchResult:
     """Immutable. Build one as SearchResult(chunk=c).with_score(name, value),
     chaining with_score() for each score a stage (retrieval, fusion, reranking)
-    contributes. There is no other way to set a score, so a SearchResult can be
-    freely shared/reused across stages without risk of one stage's write
-    leaking into another's."""
+    contributes, or with_scores() to merge a whole mapping at once. `scores`
+    may be passed as a plain dict or any Mapping and is always stored
+    immutably, so a SearchResult can be freely shared/reused across stages
+    without risk of one stage's write leaking into another's."""
 
     chunk: Chunk
-    scores: MappingProxyType[str, float] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
+    scores: Mapping[str, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "scores", MappingProxyType(dict(self.scores)))
 
     def with_score(self, name: str, value: float) -> SearchResult:
-        return SearchResult(self.chunk, MappingProxyType({**self.scores, name: value}))
+        return SearchResult(self.chunk, {**self.scores, name: value})
+
+    def with_scores(self, scores: Mapping[str, float]) -> SearchResult:
+        return SearchResult(self.chunk, {**self.scores, **scores})
 
     def score(self, name: str) -> float:
         return self.scores[name]

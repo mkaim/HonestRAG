@@ -1,6 +1,6 @@
 import heapq
 
-from models import ChunkID, RankFusion, SearchResult
+from models import Chunk, ChunkID, RankFusion, SearchResult
 
 
 class RRF(RankFusion):
@@ -14,24 +14,29 @@ class RRF(RankFusion):
     def merge(
         self, rankings: list[list[SearchResult]], limit: int
     ) -> list[SearchResult]:
-        merged: dict[ChunkID, SearchResult] = {}
+        chunks: dict[ChunkID, Chunk] = {}
+        scores_by_chunk: dict[ChunkID, dict[str, float]] = {}
         rrf_scores: dict[ChunkID, float] = {}
 
         for ranking in rankings:
-            for sr in ranking:
-                out = merged.setdefault(sr.chunk.id, SearchResult(chunk=sr.chunk))
-                for name, value in sr.scores.items():
-                    out = out.with_score(name, value)
-                merged[sr.chunk.id] = out
-                rrf_scores.setdefault(sr.chunk.id, 0.0)
-
-        for ranking in rankings:
             for rank, sr in enumerate(ranking, start=1):
-                rrf_scores[sr.chunk.id] += 1.0 / (rank + self.k)
+                chunks.setdefault(sr.chunk.id, sr.chunk)
+                # merge previous chunk's scores:
+                scores_by_chunk.setdefault(sr.chunk.id, {}).update(sr.scores)
+                # calculate this chunk's reciprocal-rank contribution for this ranking.
+                rrf_scores[sr.chunk.id] = rrf_scores.get(sr.chunk.id, 0.0) + 1.0 / (
+                    rank + self.k
+                )
 
-        merged = [
-            sr.with_score(self.SCORE_FIELD, rrf_scores[chunk_id])
-            for chunk_id, sr in merged.items()
+        results = [
+            SearchResult(
+                chunk=chunks[chunk_id],
+                scores={
+                    **scores_by_chunk[chunk_id],  # copy pervious scores of chunks
+                    self.SCORE_FIELD: rrf_scores[chunk_id],
+                },
+            )
+            for chunk_id in chunks
         ]
 
-        return heapq.nlargest(limit, merged, key=lambda sr: sr.score(self.SCORE_FIELD))
+        return heapq.nlargest(limit, results, key=lambda sr: sr.score(self.SCORE_FIELD))
