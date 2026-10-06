@@ -124,3 +124,61 @@ def test_size_and_overlap_validation():
         BlockChunker(size=0)
     with pytest.raises(ValueError):
         BlockChunker(overlap=-1)
+
+
+def test_chunk_same_level_header_replaces_breadcrumb():
+    blocks = [
+        Header("H1", level=1),
+        Paragraph("A", level=1),
+        Header("H2", level=1),
+        Paragraph("B", level=1),
+    ]
+    chunks = list(BlockChunker(size=100, overlap=0).chunk("doc1", blocks))
+
+    assert [c.content for c in chunks] == ["A", "B"]
+    assert [c.embedding_text for c in chunks] == ["[H1]\nA", "[H2]\nB"]
+
+
+def test_chunk_header_level_jump():
+    blocks = [
+        Header("H1", level=1),
+        Header("H3", level=3),
+        Paragraph("deep", level=3),
+    ]
+    chunks = list(BlockChunker(size=100, overlap=0).chunk("doc1", blocks))
+
+    assert chunks[0].embedding_text == "[H1 > H3]\ndeep"
+
+
+def test_chunk_deep_stack_pop():
+    blocks = [
+        Header("H1", level=1),
+        Header("H1.1", level=2),
+        Header("H1.1.1", level=3),
+        Paragraph("deep", level=3),
+        Paragraph("top", level=1),
+    ]
+    chunks = list(BlockChunker(size=100, overlap=0).chunk("doc1", blocks))
+
+    assert [c.content for c in chunks] == ["deep", "top"]
+    assert [c.embedding_text for c in chunks] == [
+        "[H1 > H1.1 > H1.1.1]\ndeep",
+        "[H1]\ntop",
+    ]
+
+
+def test_chunk_overlap_uses_full_previous_content_when_shorter():
+    chunks = list(
+        BlockChunker(size=4, overlap=10).chunk("doc1", _paragraphs("aa", "bb", "cc"))
+    )
+
+    assert [c.content for c in chunks] == ["aa", "bb", "cc"]
+    assert [c.embedding_text for c in chunks] == ["aa", "aa\n\nbb", "bb\n\ncc"]
+
+
+def test_chunk_skips_empty_paragraphs():
+    blocks = [Paragraph("A"), Paragraph(""), Paragraph("B")]
+    chunks = list(BlockChunker(size=100, overlap=0).chunk("doc1", blocks))
+
+    assert [c.content for c in chunks] == ["A\n\nB"]
+    assert chunks[0].embedding_text == "A\n\nB"
