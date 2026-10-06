@@ -6,10 +6,16 @@ from llm.agent import QuoteResult, Role, _chunk_content, quote_in_chunk
 
 COMPLETENESS_SUFFIX = (
     "\n\nFor each sub-question listed above, decide whether the answer "
-    "actually addresses it. If covered, cite the id of the single chunk "
-    "backing that coverage plus a verbatim quote copied exactly from that "
-    "chunk - do not paraphrase or alter it. If not covered, leave chunk_id "
-    "and quote empty."
+    "actually and fully addresses it. Be strict about the question's "
+    "specifics: timeframes, locations, quantities, and named entities must "
+    "match. If the answer addresses a related but different question - for "
+    "example it says 'medieval Europe' when the question asks about 'modern "
+    "Europe', or gives a 'what' when the question asks 'when' - mark "
+    "covered=false and explain why in reason. Only mark covered=true when "
+    "the cited chunk directly entails an answer that matches the question "
+    "as asked. If covered, cite the id of the single chunk backing that "
+    "coverage plus a verbatim quote copied exactly from that chunk - do not "
+    "paraphrase or alter it. If not covered, leave chunk_id and quote empty."
 )
 
 
@@ -17,6 +23,10 @@ class SubQuestionCoverage(BaseModel):
     question: str = Field(description="exact copy of the sub-question checked")
     covered: bool = Field(
         description="whether the answer actually addresses this sub-question"
+    )
+    reason: str = Field(
+        default="",
+        description="briefly why the answer does or does not address this sub-question",
     )
     chunk_id: str = Field(
         default="",
@@ -41,6 +51,7 @@ class SubQuestionResult:
     question: str
     quote: QuoteResult | None
     """None if the model did not claim coverage for this sub-question."""
+    reason: str = ""
 
     @property
     def covered(self) -> bool:
@@ -93,5 +104,7 @@ class CompletenessChecker(Role[CompletenessOutput]):
                 chunk_content = _chunk_content(sq.chunk_id, contents)
                 verified = quote_in_chunk(sq.quote, chunk_content)
                 quote = QuoteResult(sq.chunk_id, sq.quote, verified)
-            results.append(SubQuestionResult(question=sq.question, quote=quote))
+            results.append(
+                SubQuestionResult(question=sq.question, quote=quote, reason=sq.reason)
+            )
         return CompletenessVerification(subquestions=results)

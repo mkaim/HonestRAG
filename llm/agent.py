@@ -76,8 +76,8 @@ class Role[T: BaseModel]:
 
 
 def _normalize(text: str) -> str:
-    text = text.strip().strip("\"'“”‘’")
-    return re.sub(r"\s+", " ", text).lower()
+    text = re.sub(r"[\"'“”‘’]", "", text)
+    return re.sub(r"\s+", " ", text).strip().lower()
 
 
 def quote_in_chunk(quote: str, chunk_content: str) -> bool:
