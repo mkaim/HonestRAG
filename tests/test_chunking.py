@@ -108,9 +108,7 @@ def test_chunk_paragraph_without_level_inherits_current_header():
 
 
 def test_chunk_single_oversized_block_is_emitted_alone():
-    chunks = list(
-        BlockChunker(size=10, overlap=0).chunk("doc1", _paragraphs("x" * 50))
-    )
+    chunks = list(BlockChunker(size=10, overlap=0).chunk("doc1", _paragraphs("x" * 50)))
 
     assert len(chunks) == 1
     assert chunks[0].content == "x" * 50

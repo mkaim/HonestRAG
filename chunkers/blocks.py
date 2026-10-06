@@ -34,9 +34,7 @@ class BlockChunker(Chunker):
                 overlap_text = ""
 
             body = (
-                f"{overlap_text}{_PARAGRAPH_SEP}{content}"
-                if overlap_text
-                else content
+                f"{overlap_text}{_PARAGRAPH_SEP}{content}" if overlap_text else content
             )
             prefix = _breadcrumb(breadcrumb)
             yield Chunk(

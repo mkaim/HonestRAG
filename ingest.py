@@ -87,9 +87,7 @@ def main() -> None:
     if args.id and (args.dir or len(args.files) != 1):
         parser.error("--id requires exactly one file input")
 
-    documents = _collect_documents(
-        args.files, args.dir, args.id, args.max_block_size
-    )
+    documents = _collect_documents(args.files, args.dir, args.id, args.max_block_size)
     if not documents:
         parser.error("nothing to ingest")
 

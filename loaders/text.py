@@ -6,8 +6,6 @@ from models import Block, Loader, Paragraph
 def text_to_blocks(text: str, max_size: int) -> list[Paragraph]:
     """Split plain text on blank lines into paragraphs, hard-splitting any
     paragraph longer than max_size into smaller paragraphs."""
-    if max_size <= 0:
-        raise ValueError("max_size must be positive")
 
     paragraphs = [Paragraph(s.strip()) for s in text.split("\n\n") if s.strip()]
     return [
@@ -22,6 +20,8 @@ class TextFileLoader(Loader):
     paragraphs no longer than max_size. `source` is a filesystem path."""
 
     def __init__(self, max_size: int):
+        if max_size <= 0:
+            raise ValueError("max_size must be positive")
         self.max_size = max_size
 
     def load(self, source: str) -> tuple[list[Block], dict]:
