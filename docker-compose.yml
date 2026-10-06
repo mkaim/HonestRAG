@@ -29,6 +29,9 @@ services:
       RAG_LLM_API_KEY: ${RAG_LLM_API_KEY}
       RAG_LLM_MODEL: ${RAG_LLM_MODEL}
       RAG_DEBUG: ${RAG_DEBUG:-false}
+    volumes:
+      # Keeps downloaded embedding models across rebuilds and recreates.
+      - hf_cache:/root/.cache/huggingface
     extra_hosts:
       - "${RAG_LLM_HOST:-localhost}:${RAG_LLM_HOST_IP:-127.0.0.1}"
     healthcheck:
@@ -40,10 +43,13 @@ services:
       interval: 10s
       timeout: 5s
       retries: 6
-      start_period: 15s
+      # Failures don't count yet: the first start downloads the embedding
+      # model into hf_cache, which can take minutes.
+      start_period: 5m
     depends_on:
       postgres:
         condition: service_healthy
 
 volumes:
   postgres_data:
+  hf_cache:
