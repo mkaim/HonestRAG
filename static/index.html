@@ -209,7 +209,10 @@
                     `${s.verifier_partially_supported} partial, ` +
                     `${s.verifier_unsupported} no, ` +
                     `${s.verifier_no_claims} declined</span>`,
-                  `<span>Sub-questions covered: ${s.subquestions_covered}/${s.subquestions_total}</span>`,
+                  `<span>Sub-questions: ${s.subquestions_covered} covered, ` +
+                    `${s.subquestions_not_in_sources} not in sources, ` +
+                    `${s.subquestions_missed} missed ` +
+                    `(of ${s.subquestions_total})</span>`,
                 ].join("");
               }
 

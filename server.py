@@ -3,7 +3,8 @@
     uv run uvicorn server:app --reload
 
 Serves a single static page (static/index.html) with a textarea; POSTing a
-question to /api/ask retrieves chunks and returns the LLM's answer.
+question to /api/ask streams each pipeline stage as server-sent events,
+ending with the verified answer.
 """
 
 import json
@@ -21,10 +22,14 @@ from embedders import SenTranEmbedder
 from fusion import RRF
 from llm import (
     Answerer,
+    AnswerOutput,
+    AnswerVerification,
     CompletenessChecker,
     CompletenessVerification,
     Decomposer,
     Role,
+    RoleResult,
+    SubQuestionResult,
     Verifier,
     VerifierVerification,
     build_agent,
@@ -76,107 +81,27 @@ async def index() -> FileResponse:
     return FileResponse("static/index.html")
 
 
-def _sse(stage: str, status: str, **fields) -> str:
-    return f"data: {json.dumps({'stage': stage, 'status': status, **fields})}\n\n"
+def _sse(stage: str, status: str, data: dict | None = None, debug=None) -> str:
+    event = {"stage": stage, "status": status}
+    if data is not None:
+        event["data"] = data
+    if debug is not None:
+        event["debug"] = debug
+    return f"data: {json.dumps(event)}\n\n"
 
 
-class RoleRunner:
-    """Wraps role.run() as an async-iterable of SSE lines: a 'running' line,
-    then the call, then a 'done' line carrying its output/debug data. Stage
-    name comes from the role itself (role.NAME). Iterate it for the SSE
-    lines; .output/.verification hold the result once the loop finishes."""
-
-    def __init__(self, role: Role, prompt_prefix: str, contents: dict[str, str]):
-        self.role = role
-        self.prompt_prefix = prompt_prefix
-        self.contents = contents
-        self.output = None
-        self.verification = None
-
-    async def __aiter__(self) -> AsyncIterator[str]:
-        yield _sse(self.role.NAME, "running")
-
-        result = await self.role.run(self.prompt_prefix, self.contents, debug=cfg.debug)
-        self.output = result.output
-        self.verification = result.verification
-
-        data = result.output.model_dump()
-        if result.verification is not None:
-            data["verification"] = result.verification.to_dict()
-        fields = {"data": data}
-        if result.raw_messages is not None:
-            fields["debug"] = json.loads(result.raw_messages)
-        yield _sse(self.role.NAME, "done", **fields)
+def _role_done(role: Role, result: RoleResult) -> str:
+    data = result.output.model_dump()
+    if result.verification is not None:
+        data["verification"] = result.verification.to_dict()
+    debug = json.loads(result.raw_messages) if result.raw_messages else None
+    return _sse(role.NAME, "done", data, debug)
 
 
-async def _ask_stream(question: str) -> AsyncIterator[str]:
-    decomposer = RoleRunner(Decomposer(agent), format_query_prefix(question), {})
-    async for line in decomposer:
-        yield line
-    decomposition = decomposer.output
-
-    yield _sse("search", "running")
-    results = await rag.search(decomposition.questions)
-    by_chunk_id = {r.chunk.id: r for per_query in results for r in per_query}
-    chunks = list(by_chunk_id.values())
-    search_fields = {"data": {"chunk_count": len(chunks)}}
-    if cfg.debug:
-        search_fields["debug"] = {
-            "chunks": [
-                {"chunk_id": r.chunk.id, "content": r.chunk.content} for r in chunks
-            ]
-        }
-    yield _sse("search", "done", **search_fields)
-
-    if not chunks:
-        yield _sse(
-            "final",
-            "done",
-            data={
-                "answer": "No matching passages found in the corpus.",
-                "questions": decomposition.questions,
-                "subanswers": [],
-                "verification": VerifierVerification().to_dict(),
-                "completeness": CompletenessVerification().to_dict(),
-                "stats": {
-                    "total_facts": 0,
-                    "answer_quotes_verified": 0,
-                    "verifier_fully_supported": 0,
-                    "verifier_partially_supported": 0,
-                    "verifier_unsupported": 0,
-                    "verifier_hallucinated_quotes": 0,
-                    "verifier_no_claims": 0,
-                    "subquestions_covered": 0,
-                    "subquestions_total": 0,
-                    "complete": False,
-                },
-            },
-        )
-        return
-
-    prompt_prefix = format_prompt_prefix(question, chunks, decomposition.questions)
-    contents = chunks_by_id(chunks)
-
-    answerer = RoleRunner(Answerer(agent), prompt_prefix, contents)
-    async for line in answerer:
-        yield line
-    answer, answer_verification = answerer.output, answerer.verification
-
-    prompt_prefix += format_answer_suffix(answer)
-
-    verifier = RoleRunner(Verifier(agent), prompt_prefix, contents)
-    async for line in verifier:
-        yield line
-    verification = verifier.verification
-
-    completeness_checker = RoleRunner(
-        CompletenessChecker(agent), prompt_prefix, contents
-    )
-    async for line in completeness_checker:
-        yield line
-    completeness = completeness_checker.verification
-
-    subanswers = [
+def _subanswers(answer: AnswerOutput, verification: AnswerVerification) -> list[dict]:
+    """Each sub-answer with its facts, each fact flagged with whether its
+    quote verified against the cited chunk."""
+    return [
         {
             "question": sub.question,
             "answer": sub.answer,
@@ -187,44 +112,109 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
                     "quote": fact.quote,
                     "verified": result.verified,
                 }
-                for fact, result in zip(sub.facts, sub_verification.facts, strict=True)
+                for fact, result in zip(sub.facts, sub_check.facts, strict=True)
             ],
         }
-        for sub, sub_verification in zip(
-            answer.subanswers, answer_verification.subanswers, strict=True
+        for sub, sub_check in zip(
+            answer.subanswers, verification.subanswers, strict=True
         )
     ]
 
-    total_facts = sum(len(sub["facts"]) for sub in subanswers)
-    answer_verified_quotes = sum(
-        1 for sub in subanswers for fact in sub["facts"] if fact["verified"]
-    )
+
+def _final(
+    answer: str,
+    questions: list[str],
+    subanswers: list[dict],
+    verification: VerifierVerification,
+    completeness: CompletenessVerification,
+) -> str:
+    facts = [fact for sub in subanswers for fact in sub["facts"]]
     stats = {
-        "total_facts": total_facts,
-        "answer_quotes_verified": answer_verified_quotes,
+        "total_facts": len(facts),
+        "answer_quotes_verified": sum(fact["verified"] for fact in facts),
         "verifier_fully_supported": verification.fully_supported,
         "verifier_partially_supported": verification.partially_supported,
         "verifier_unsupported": verification.unsupported,
         "verifier_hallucinated_quotes": verification.hallucinated_quotes,
         "verifier_no_claims": verification.no_claims,
-        "subquestions_covered": (
-            len(completeness.subquestions) - len(completeness.missing)
-        ),
+        "subquestions_covered": len(completeness.covered),
+        "subquestions_not_in_sources": len(completeness.not_in_sources),
+        "subquestions_missed": len(completeness.missed),
         "subquestions_total": len(completeness.subquestions),
         "complete": completeness.complete,
     }
+    data = {
+        "answer": answer,
+        "questions": questions,
+        "subanswers": subanswers,
+        "verification": verification.to_dict(),
+        "completeness": completeness.to_dict(),
+        "stats": stats,
+    }
+    return _sse("final", "done", data)
 
-    yield _sse(
-        "final",
-        "done",
-        data={
-            "answer": answer.answer,
-            "questions": decomposition.questions,
-            "subanswers": subanswers,
-            "verification": verification.to_dict(),
-            "completeness": completeness.to_dict(),
-            "stats": stats,
-        },
+
+async def _ask_stream(question: str) -> AsyncIterator[str]:
+    """Runs the pipeline - decompose, search, answer, verify, completeness -
+    streaming a 'running' and a 'done' event per stage, then 'final'."""
+    decomposer = Decomposer(agent)
+    yield _sse(decomposer.NAME, "running")
+    decomposed = await decomposer.run(
+        format_query_prefix(question), {}, debug=cfg.debug
+    )
+    yield _role_done(decomposer, decomposed)
+    questions = decomposed.output.questions
+
+    yield _sse("search", "running")
+    results = await rag.search(questions)
+    # One entry per chunk, even if several sub-questions retrieved it.
+    chunks = list({r.chunk.id: r for per_query in results for r in per_query}.values())
+    contents = chunks_by_id(chunks)
+    debug = {"chunks": contents} if cfg.debug else None
+    yield _sse("search", "done", {"chunk_count": len(chunks)}, debug)
+
+    if not chunks:
+        not_found = CompletenessVerification(
+            [
+                SubQuestionResult(q, "not_in_sources", reason="no passages found")
+                for q in questions
+            ]
+        )
+        yield _final(
+            "No matching passages found in the corpus.",
+            questions,
+            [],
+            VerifierVerification(),
+            not_found,
+        )
+        return
+
+    prompt_prefix = format_prompt_prefix(question, chunks, questions)
+
+    answerer = Answerer(agent)
+    yield _sse(answerer.NAME, "running")
+    answered = await answerer.run(prompt_prefix, contents, debug=cfg.debug)
+    yield _role_done(answerer, answered)
+
+    # The verifier and completeness checker both judge the answer.
+    prompt_prefix += format_answer_suffix(answered.output)
+
+    verifier = Verifier(agent)
+    yield _sse(verifier.NAME, "running")
+    verified = await verifier.run(prompt_prefix, contents, debug=cfg.debug)
+    yield _role_done(verifier, verified)
+
+    checker = CompletenessChecker(agent)
+    yield _sse(checker.NAME, "running")
+    checked = await checker.run(prompt_prefix, contents, debug=cfg.debug)
+    yield _role_done(checker, checked)
+
+    yield _final(
+        answered.output.answer,
+        questions,
+        _subanswers(answered.output, answered.verification),
+        verified.verification,
+        checked.verification,
     )
 
 
