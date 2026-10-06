@@ -29,6 +29,16 @@ services:
       RAG_DEBUG: ${RAG_DEBUG:-false}
     extra_hosts:
       - "${RAG_LLM_HOST:-localhost}:${RAG_LLM_HOST_IP:-127.0.0.1}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
     depends_on:
       postgres:
         condition: service_healthy
