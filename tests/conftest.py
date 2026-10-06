@@ -4,6 +4,7 @@ import psycopg
 import pytest
 import pytest_asyncio
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
+from transformers import AutoTokenizer
 
 from config import Settings
 from db import PsqlRagDb
@@ -49,8 +50,18 @@ def _ensure_test_db() -> None:
 
 
 @pytest.fixture(scope="session")
+def hf_tokenizer():
+    """Just the embedding model's tokenizer: a few MB, unlike the model."""
+    return AutoTokenizer.from_pretrained(EMBED_MODEL)
+
+
+@pytest.fixture(scope="session")
 def embedder() -> SenTranEmbedder:
-    return SenTranEmbedder(EMBED_MODEL)
+    return SenTranEmbedder(
+        EMBED_MODEL,
+        query_prefix=_settings.embed_query_prefix,
+        document_prefix=_settings.embed_document_prefix,
+    )
 
 
 @pytest_asyncio.fixture

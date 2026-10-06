@@ -28,9 +28,8 @@ def _collect_documents(
     paths: list[str],
     directory: str | None,
     doc_id: str | None,
-    max_block_size: int,
 ) -> list[tuple[Document, list[Block]]]:
-    loader = TextFileLoader(max_size=max_block_size)
+    loader = TextFileLoader()
     docs: list[tuple[Document, list[Block]]] = []
 
     if directory:
@@ -43,10 +42,7 @@ def _collect_documents(
     for raw in paths:
         if raw == "-":
             docs.append(
-                (
-                    Document(id=doc_id or "stdin"),
-                    text_to_blocks(sys.stdin.read(), max_block_size),
-                )
+                (Document(id=doc_id or "stdin"), text_to_blocks(sys.stdin.read()))
             )
         else:
             blocks, metadata = loader.load(raw)
@@ -57,9 +53,19 @@ def _collect_documents(
 
 async def _run(documents: list[tuple[Document, list[Block]]]) -> None:
     cfg = Settings()
-    chunker = BlockChunker()
+    embedder = SenTranEmbedder(
+        cfg.embed_model,
+        query_prefix=cfg.embed_query_prefix,
+        document_prefix=cfg.embed_document_prefix,
+    )
+    chunker = BlockChunker(
+        tokenizer=embedder.tokenizer,
+        content_tokens=cfg.chunk_tokens,
+        overlap_tokens=cfg.chunk_overlap_tokens,
+        breadcrumb_tokens=cfg.chunk_breadcrumb_tokens,
+    )
 
-    async with PsqlRagDb(cfg.dsn, SenTranEmbedder(cfg.embed_model)) as db:
+    async with PsqlRagDb(cfg.dsn, embedder) as db:
         total_chunks = 0
         for document, blocks in documents:
             chunks: list[Chunk] = list(chunker.chunk(document.id, blocks))
@@ -74,12 +80,6 @@ def main() -> None:
     parser.add_argument("files", nargs="*", help="files to ingest, or - for stdin")
     parser.add_argument("--dir", help="ingest every .txt/.md file under this directory")
     parser.add_argument("--id", help="document id (only valid with a single input)")
-    parser.add_argument(
-        "--max-block-size",
-        type=int,
-        default=1000,
-        help="hard-split loaded text so no paragraph exceeds this many characters",
-    )
     args = parser.parse_args()
 
     if not args.files and not args.dir:
@@ -87,7 +87,7 @@ def main() -> None:
     if args.id and (args.dir or len(args.files) != 1):
         parser.error("--id requires exactly one file input")
 
-    documents = _collect_documents(args.files, args.dir, args.id, args.max_block_size)
+    documents = _collect_documents(args.files, args.dir, args.id)
     if not documents:
         parser.error("nothing to ingest")
 

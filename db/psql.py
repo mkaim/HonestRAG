@@ -96,7 +96,7 @@ class PsqlRagDb(RagDb):
     async def add(self, document: Document, chunks: list[Chunk]) -> None:
         if not chunks:
             return
-        embeddings = await self.embedder.embed(
+        embeddings = await self.embedder.embed_documents(
             [c.embedding_text or c.content for c in chunks]
         )
         table = await self.ensure_vector_table()
@@ -133,7 +133,7 @@ class PsqlRagDb(RagDb):
                     *(self._search_bm25(q, limit) for q in queries)
                 )
             case SearchMode.SEMANTIC:
-                embeddings = await self.embedder.embed(queries)
+                embeddings = await self.embedder.embed_queries(queries)
                 return await asyncio.gather(
                     *(self._search_semantic(e, limit) for e in embeddings)
                 )

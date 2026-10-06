@@ -27,12 +27,12 @@ CREATE INDEX chunk_bm25_idx
     WITH (key_field = 'id');
 
 -- One embedding table per (model, dims). Created on demand by the app,
--- but here is the shape for the default model (all-MiniLM-L6-v2, 384 dims):
-CREATE TABLE all_minilm_l6_v2_384 (
+-- but here is the shape for the default model (multilingual-e5-small, 384 dims):
+CREATE TABLE multilingual_e5_small_384 (
     chunk_id  BIGINT PRIMARY KEY REFERENCES chunk(id) ON DELETE CASCADE,
     embedding vector(384) NOT NULL
 );
 
-CREATE INDEX all_minilm_l6_v2_384_hnsw_idx
-    ON all_minilm_l6_v2_384
+CREATE INDEX multilingual_e5_small_384_hnsw_idx
+    ON multilingual_e5_small_384
     USING hnsw (embedding vector_ip_ops);

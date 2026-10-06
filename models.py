@@ -102,10 +102,32 @@ class Chunker(Protocol):
 
 
 class Embedder(Protocol):
+    """Embeds raw texts via `embed`. Callers use `embed_queries` and
+    `embed_documents`, which prepend the model's expected prefix (e.g. E5's
+    "query: " / "passage: "; empty for models that don't use one)."""
+
     model: str
     dims: int
+    query_prefix: str
+    document_prefix: str
 
     async def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+    async def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        return await self.embed([f"{self.query_prefix}{t}" for t in texts])
+
+    async def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return await self.embed([f"{self.document_prefix}{t}" for t in texts])
+
+
+class Tokenizer(Protocol):
+    max_tokens: int
+
+    def count(self, text: str) -> int: ...
+
+    def split(self, text: str, limit: int) -> list[str]: ...
+
+    def tail(self, text: str, n: int) -> str: ...
 
 
 class RankFusion(Protocol):

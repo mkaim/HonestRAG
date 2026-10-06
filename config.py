@@ -14,6 +14,14 @@ class Settings(BaseSettings):
 
     dsn: str
     embed_model: str
+    # Prepended to texts before embedding, for models trained with them
+    # (e.g. E5: "query: " / "passage: "). Mind the trailing space.
+    embed_query_prefix: str = ""
+    embed_document_prefix: str = ""
+    # Token budgets per chunk, measured with the embedder's tokenizer.
+    chunk_tokens: int = 400
+    chunk_overlap_tokens: int = 40
+    chunk_breadcrumb_tokens: int = 64
 
     # Any OpenAI-compatible endpoint.
     llm_base_url: str

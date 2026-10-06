@@ -46,7 +46,11 @@ agent = build_agent(
     native_output_requires_schema_in_instructions=cfg.llm_native_output_requires_schema_in_instructions,
 )
 
-embedder = SenTranEmbedder(cfg.embed_model)
+embedder = SenTranEmbedder(
+    cfg.embed_model,
+    query_prefix=cfg.embed_query_prefix,
+    document_prefix=cfg.embed_document_prefix,
+)
 db = PsqlRagDb(cfg.dsn, embedder)
 rag = Rag(db, RRF(), rf_limit=TOP_K)
 
