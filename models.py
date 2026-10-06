@@ -30,16 +30,34 @@ class Chunk:
     """A retrieval unit: one piece of a Document's text, as produced by a
     Chunker. `id` is derived from document_id + index, never set directly, so
     it can never drift out of sync with them. `metadata` is this chunk's own
-    (e.g. page number, offsets) - not a copy of the parent Document's."""
+    (e.g. page number, offsets) - not a copy of the parent Document's.
+    `content` is what is stored and cited; `embedding_text`, when set, is the
+    enriched text (header breadcrumbs, overlap) used to build the vector."""
 
     document_id: DocumentID
     index: int
     content: str
     metadata: dict[str, str | int | float] = field(default_factory=dict)
+    embedding_text: str | None = None
 
     @property
     def id(self) -> str:
         return f"{self.document_id}#{self.index}"
+
+
+@dataclass(frozen=True)
+class Paragraph:
+    text: str
+    level: int | None = None
+
+
+@dataclass(frozen=True)
+class Header:
+    text: str
+    level: int
+
+
+Block = Paragraph | Header
 
 
 @dataclass(frozen=True)
@@ -68,16 +86,19 @@ class SearchResult:
 
 
 class Loader(Protocol):
-    def load(self, source: str) -> tuple[str, dict[str, str | int | float]]:
-        """Extract text and any metadata discoverable from the source itself
-        (e.g. a Notion page's title). Metadata is empty if the format has
-        nothing to offer (e.g. plain text). The caller decides how to merge
-        this with metadata it already knows when building a Document."""
+    def load(self, source: str) -> tuple[list[Block], dict[str, str | int | float]]:
+        """Extract structured blocks and any metadata discoverable from the
+        source itself (e.g. a Notion page's title). Metadata is empty if the
+        format has nothing to offer (e.g. plain text). The caller decides how
+        to merge this with metadata it already knows when building a
+        Document."""
         ...
 
 
 class Chunker(Protocol):
-    def chunk(self, document_id: DocumentID, text: str) -> Iterator[Chunk]: ...
+    def chunk(
+        self, document_id: DocumentID, blocks: list[Block]
+    ) -> Iterator[Chunk]: ...
 
 
 class Embedder(Protocol):

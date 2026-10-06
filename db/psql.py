@@ -96,7 +96,9 @@ class PsqlRagDb(RagDb):
     async def add(self, document: Document, chunks: list[Chunk]) -> None:
         if not chunks:
             return
-        embeddings = await self.embedder.embed([c.content for c in chunks])
+        embeddings = await self.embedder.embed(
+            [c.embedding_text or c.content for c in chunks]
+        )
         table = await self.ensure_vector_table()
         async with self.pool.connection() as conn:
             cur = await conn.execute(

@@ -1,3 +1,3 @@
-from chunkers.fixed_size import FixedSizeChunker
+from chunkers.blocks import BlockChunker
 
-__all__ = ["FixedSizeChunker"]
+__all__ = ["BlockChunker"]

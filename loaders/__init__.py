@@ -1,3 +1,3 @@
-from loaders.text import TextFileLoader
+from loaders.text import TextFileLoader, text_to_blocks
 
-__all__ = ["TextFileLoader"]
+__all__ = ["TextFileLoader", "text_to_blocks"]
