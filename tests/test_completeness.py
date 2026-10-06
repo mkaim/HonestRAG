@@ -37,6 +37,7 @@ def test_covered_claim_with_unverified_quote_is_missed():
     assert result.missed == ["Who?"]
     assert not result.complete
     assert result.hallucinated_quotes == 1
+    assert "downgraded: quote not found in doc#0" in result.subquestions[0].reason
 
 
 def test_not_in_sources_keeps_answer_complete():

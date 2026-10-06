@@ -80,15 +80,38 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
+# "...", "…", optionally bracketed as "[...]" or "(…)".
+_ELLIPSIS = re.compile(r"[\[(]?(?:\.{3,}|…)[\])]?")
+# Each part of an elided quote must be this long, so a quote can't pass by
+# stitching together fragments short enough to match almost anywhere.
+_MIN_SEGMENT_WORDS = 3
+
+
 def quote_in_chunk(quote: str, chunk_content: str) -> bool:
     """Deterministic check that `quote` actually appears in `chunk_content`,
-    tolerant of whitespace and quote-mark differences. This is the ground
-    truth for whether an LLM-produced quote is real or hallucinated - it
-    does not trust the LLM's own supported/quote claim."""
-    normalized_quote = _normalize(quote)
-    if not normalized_quote:
+    tolerant of whitespace and quote-mark differences. A quote may skip text
+    with an ellipsis; each part must then appear verbatim, in order. This is
+    the ground truth for whether an LLM-produced quote is real or
+    hallucinated - it does not trust the LLM's own supported/quote claim."""
+    chunk = _normalize(chunk_content)
+    whole = _normalize(quote)
+    if not whole:
         return False
-    return normalized_quote in _normalize(chunk_content)
+    if whole in chunk:
+        return True
+
+    segments = [s for s in map(_normalize, _ELLIPSIS.split(quote)) if s]
+    if not segments or segments == [whole]:
+        return False  # nothing but ellipses, or no ellipsis and no match
+    position = 0
+    for segment in segments:
+        if len(segment.split()) < _MIN_SEGMENT_WORDS:
+            return False
+        found = chunk.find(segment, position)
+        if found < 0:
+            return False
+        position = found + len(segment)
+    return True
 
 
 def _chunk_content(chunk_id: str, contents: dict[str, str]) -> str:

@@ -19,10 +19,13 @@ COMPLETENESS_SUFFIX = (
     "quantities, and named entities must match. If the answer addresses a "
     "related but different question - for example it says 'medieval Europe' "
     "when the question asks about 'modern Europe', or gives a 'what' when "
-    "the question asks 'when' - it is missed. Explain the status briefly in "
+    "the question asks 'when' - it is missed. If the sub-question rests on a "
+    "premise the context contradicts, it is only covered when the answer "
+    "points out the error. Explain the status briefly in "
     "reason. If covered, cite the id of the single chunk backing that "
-    "coverage plus a verbatim quote copied exactly from that chunk - do not "
-    "paraphrase or alter it. Otherwise leave chunk_id and quote empty."
+    "coverage plus a verbatim quote copied exactly from that chunk as one "
+    "contiguous span - do not paraphrase or alter it. Otherwise leave "
+    "chunk_id and quote empty."
 )
 
 Status = Literal["covered", "not_in_sources", "missed"]
@@ -123,9 +126,12 @@ class CompletenessChecker(Role[CompletenessOutput]):
                 verified = quote_in_chunk(sq.quote, chunk_content)
                 quote = QuoteResult(sq.chunk_id, sq.quote, verified)
                 status = "covered" if verified else "missed"
+            reason = sq.reason
+            if status != sq.status:
+                reason = f"{reason} [downgraded: quote not found in {sq.chunk_id}]"
             results.append(
                 SubQuestionResult(
-                    question=sq.question, status=status, quote=quote, reason=sq.reason
+                    question=sq.question, status=status, quote=quote, reason=reason
                 )
             )
         return CompletenessVerification(subquestions=results)

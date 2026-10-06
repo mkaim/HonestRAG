@@ -11,8 +11,9 @@ VERIFICATION_SUFFIX = (
     "related, but whether a careful reader would agree the quote proves the "
     "statement true. Mark it 'yes' if the quote fully entails the "
     "statement, 'partial' if it only partly supports it, 'no' if it does "
-    "not entail it at all, and copy the verbatim span you judged against "
-    "(or leave quote empty if 'no'). Separately, list any sentence in the "
+    "not entail it at all, and copy the verbatim span you judged against as "
+    "one contiguous span (or leave quote empty if 'no'). Separately, list "
+    "any sentence in the "
     "final answer that is not entailed by any fact above - whether it "
     "contradicts the data or simply adds something no fact supports."
 )
