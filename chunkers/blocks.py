@@ -137,13 +137,13 @@ class BlockChunker(Chunker):
                 if content:
                     yield breadcrumb, content
                     content = ""
-                headers = headers[: block.level - 1] + [block]
+                headers = [h for h in headers if h.level < block.level] + [block]
                 continue
             if not block.text:
                 continue
 
             if block.level is not None:
-                headers = headers[: block.level]
+                headers = [h for h in headers if h.level <= block.level]
             new_breadcrumb = tuple(headers)
             if content and new_breadcrumb != breadcrumb:
                 yield breadcrumb, content

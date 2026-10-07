@@ -89,6 +89,45 @@ def test_chunk_no_overlap_when_breadcrumb_changes():
     assert chunks[1].embedding_text == "[H1 > H1.1]\nC"
 
 
+def test_chunk_skipped_header_level_nests_under_last_seen():
+    blocks = [
+        Header("H1", level=1),
+        Header("H3", level=3),
+        Paragraph("deep", level=3),
+    ]
+    chunks = list(_chunker(100).chunk("doc1", blocks))
+
+    assert chunks[0].embedding_text == "[H1 > H3]\ndeep"
+
+
+def test_chunk_header_level_drop_after_skip_pops_by_level_not_position():
+    blocks = [
+        Header("H1", level=1),
+        Header("H3", level=3),
+        Header("H2", level=2),
+        Paragraph("body", level=2),
+    ]
+    chunks = list(_chunker(100).chunk("doc1", blocks))
+
+    assert chunks[0].embedding_text == "[H1 > H2]\nbody"
+
+
+def test_chunk_sibling_headers_at_same_skipped_level_do_not_nest():
+    blocks = [
+        Header("H1", level=1),
+        Header("H3a", level=3),
+        Paragraph("first", level=3),
+        Header("H3b", level=3),
+        Paragraph("second", level=3),
+    ]
+    chunks = list(_chunker(100).chunk("doc1", blocks))
+
+    assert [c.embedding_text for c in chunks] == [
+        "[H1 > H3a]\nfirst",
+        "[H1 > H3b]\nsecond",
+    ]
+
+
 def test_chunk_shallower_paragraph_returns_to_parent_header():
     blocks = [
         Header("H1", level=1),
