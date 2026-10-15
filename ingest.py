@@ -7,6 +7,8 @@
 Document id defaults to the file path (or "stdin"); pass --id to override for a
 single input. Each document is split into chunks before being added; the chunk
 retrieved and cited by the LLM is a slice of the file, not the whole file.
+.md files are parsed for real headers (#, ##, ...); .txt files are split on
+blank lines only, as plain paragraphs.
 """
 
 import argparse
@@ -18,10 +20,10 @@ from chunkers import BlockChunker
 from config import Settings
 from db import PsqlRagDb
 from embedders import SenTranEmbedder
-from loaders import TextFileLoader, text_to_blocks
+from loaders import MarkdownFileLoader, TextFileLoader, text_to_blocks
 from models import Block, Chunk, Document
 
-TEXT_SUFFIXES = {".txt", ".md"}
+LOADERS = {".txt": TextFileLoader(), ".md": MarkdownFileLoader()}
 
 
 def _collect_documents(
@@ -29,14 +31,13 @@ def _collect_documents(
     directory: str | None,
     doc_id: str | None,
 ) -> list[tuple[Document, list[Block]]]:
-    loader = TextFileLoader()
     docs: list[tuple[Document, list[Block]]] = []
 
     if directory:
         paths = paths + [
             str(p)
             for p in sorted(Path(directory).rglob("*"))
-            if p.suffix.lower() in TEXT_SUFFIXES
+            if p.suffix.lower() in LOADERS
         ]
 
     for raw in paths:
@@ -45,6 +46,7 @@ def _collect_documents(
                 (Document(id=doc_id or "stdin"), text_to_blocks(sys.stdin.read()))
             )
         else:
+            loader = LOADERS[Path(raw).suffix.lower()]
             blocks, metadata = loader.load(raw)
             docs.append((Document(id=doc_id or raw, metadata=metadata), blocks))
 
