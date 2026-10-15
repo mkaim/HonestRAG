@@ -26,6 +26,9 @@ dev = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
+# tests/eval is slow, needs a real corpus + embedding model, and is opt-in
+# only (`uv run pytest tests/eval`) - never part of the default run.
+addopts = "--ignore=tests/eval"
 
 [tool.ruff]
 target-version = "py314"
