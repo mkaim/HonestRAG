@@ -69,11 +69,21 @@ DO UPDATE SET embedding = EXCLUDED.embedding
 
 
 class PsqlRagDb(RagDb):
-    def __init__(self, conninfo: str, embedder: Embedder):
+    def __init__(
+        self,
+        conninfo: str,
+        embedder: Embedder,
+        min_size: int = 2,
+        max_size: int | None = None,
+    ):
         self.conninfo = conninfo
         self.embedder = embedder
         self.pool = AsyncConnectionPool(
-            conninfo, min_size=2, open=False, configure=register_vector_async
+            conninfo,
+            min_size=min_size,
+            max_size=max_size,
+            open=False,
+            configure=register_vector_async,
         )
 
     async def __aenter__(self) -> PsqlRagDb:

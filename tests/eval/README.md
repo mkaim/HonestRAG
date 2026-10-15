@@ -346,3 +346,99 @@ testing on a second, structurally different corpus (long-form prose with
 sparse headers, rather than SRD's dense short sections) to see whether
 `BlockChunker`'s advantage holds outside SRD's specific structure - in
 progress, see scripts/fetch_gutenqa.py.
+
+### 2026-10-15 — fixed a PoolTimeout that only showed up on the bigger corpus
+
+Running the full eval suite against GutenQA (480 questions, ~4x SRD's
+corpus size) hit a `psycopg_pool.PoolTimeout: couldn't get a connection
+after 30.00 sec` reliably, on every test that searches all questions at
+once. SRD never hit this. Took a while to actually find, since every
+plausible-sounding theory checked out false on direct testing:
+
+- **Not pool size** - bumped `PsqlRagDb`'s `min_size`/`max_size` (now
+  configurable, still 2/2 by default for production) well above the
+  default; still failed identically.
+- **Not event loop scope** - session-scoped async fixtures on a different
+  loop than function-scoped tests is a real pytest-asyncio footgun, and
+  looked like a plausible match, but adding `loop_scope="session"`
+  everywhere changed nothing.
+- **Not Postgres parallel workers** - ParadeDB's own docs say exhausted
+  parallel workers make queries slower, never fail or hang, which this
+  symptom contradicted anyway once checked directly.
+- **Not an open transaction from the pool's `configure=register_vector_async`
+  callback** - checked a freshly-configured connection's transaction
+  status directly; it was idle, not mid-transaction.
+- **Real network calls, but not the cause of this bug** - `SenTranEmbedder`
+  was hitting huggingface.co on every instantiation (dozens of HTTP
+  requests, confirmed via `--log-cli-level=DEBUG`) even when the model was
+  already cached locally. Genuinely worth fixing (`local_files_only`,
+  checked against `huggingface_hub.scan_cache_dir()` first) and fixed
+  below, but eliminating it didn't fix the PoolTimeout either.
+
+**The actual cause**, found by watching `psycopg.pool`'s own debug log
+live during a failing run: hundreds of "connection requested" log lines
+with only a handful of "connection given"/"growing pool" responses - the
+pool grew to size 11 once, then never grew again despite constant demand,
+no errors logged. With `RETRIEVAL_LIMIT` (or the full 480-question gold
+set) all launched via one `asyncio.gather`, there are enough concurrently
+scheduled tasks on one event loop that `psycopg_pool`'s own background
+connection-management coroutines - tasks on that same loop - stop getting
+scheduled often enough to keep the pool healthy under load. Confirmed by
+fix: batching the same 480 queries into groups of 10, awaiting each batch
+fully before starting the next, passed cleanly every time. The live app
+never hits this - it only ever searches a handful of sub-questions at
+once, nowhere near enough concurrent tasks to starve the pool's own
+coroutines.
+
+Fix: `tests/eval/batching.py`'s `BatchedRagDb` wraps the real `PsqlRagDb`
+and splits any `search()` call into batches of 10 queries, awaited fully
+one batch at a time - transparent to every test, since it implements the
+same `RagDb` protocol. `conftest.py`'s `eval_db*` fixtures now yield the
+wrapped db. This is purely an eval-harness fix; `PsqlRagDb` itself (and
+the live app) is unaffected.
+
+Rerunning the full GutenQA suite afterward: all 4 tests passed cleanly,
+no PoolTimeout, in under 7 minutes total (vs. ~2 hours for the two failed
+attempts before this fix, most of that spent re-ingesting after the
+first attempt's failure left things in a half-ingested state before
+`--drop-eval-db` behavior was fully sorted out).
+
+### 2026-10-15 — GutenQA vs. SRD: does BlockChunker's advantage hold on different structure?
+
+`multilingual-e5-base`, all 480 GutenQA questions (untiered - every
+question runs as one group, unlike SRD's easy/medium split):
+
+| Metric | BM25, Block | BM25, FixedSize | Semantic, Block | Semantic, FixedSize |
+|---|---|---|---|---|
+| Recall@500tok | 0.537 | 0.479 | 0.440 | 0.379 |
+| Recall@2000tok | 0.696 | 0.644 | 0.673 | 0.617 |
+| Recall@4000tok | 0.754 | 0.690 | 0.748 | 0.702 |
+| MRR | 0.604 | 0.551 | 0.530 | 0.486 |
+
+**`BlockChunker` wins again, on every budget, both modes** - same
+direction as SRD's (budget-corrected) result. On a structurally opposite
+corpus (sparse chapter headers, long sections vs. SRD's dense short
+sections), the header-aware, token-packed chunker still beats a naive
+fixed-size window. This is the strongest evidence yet that `BlockChunker`'s
+advantage isn't an artifact of SRD's unusual density of sibling sections -
+it holds on ordinary long-form prose too.
+
+Breadcrumb effect on GutenQA (semantic search only, same corpus/chunker
+otherwise):
+
+| Metric | with breadcrumb | no breadcrumb |
+|---|---|---|
+| Recall@500tok | 0.440 | 0.444 |
+| Recall@2000tok | 0.673 | 0.681 |
+| Recall@4000tok | 0.748 | 0.773 |
+| MRR | 0.530 | 0.539 |
+
+Consistent with e5-base's SRD result: breadcrumb is a wash, slightly
+favoring no-breadcrumb but nowhere near a meaningful effect either way.
+Reinforces the earlier conclusion that the breadcrumb only mattered (and
+hurt) on the smallest model tested (e5-small); on e5-base it's noise
+regardless of corpus structure.
+
+RRF fusion beats both single modes here too (MRR 0.612 vs. BM25's 0.604
+and semantic's 0.530), same pattern as every other corpus/model
+combination tried so far - hybrid retrieval earns its keep consistently.

@@ -37,6 +37,7 @@ from db import PsqlRagDb
 from embedders import SenTranEmbedder
 from loaders import MarkdownFileLoader
 from models import Chunk, Chunker, Document
+from tests.eval.batching import BatchedRagDb
 
 DEFAULT_DATA_DIR = Path(__file__).parent / "data" / "dnd_srd"
 _INIT_SQL = (Path(__file__).parent.parent.parent / "postgres_init.sql").read_text()
@@ -211,20 +212,27 @@ async def _eval_db(
 
     _create_eval_db(settings, eval_dsn)
 
-    async with PsqlRagDb(eval_dsn, embedder) as db:
+    # min_size/max_size bumped from PsqlRagDb's production default
+    # (2/2, fine for the live app's one question at a time) since eval
+    # searches up to RETRIEVAL_LIMIT questions at once. Not sufficient by
+    # itself, though - see BatchedRagDb (batching.py) for the fix that
+    # actually matters: too many concurrent tasks on one event loop
+    # starves the pool's own background connection management, which is
+    # the real cause of the PoolTimeouts this ran into before that existed.
+    async with PsqlRagDb(eval_dsn, embedder, min_size=10, max_size=30) as db:
         await db.ensure_vector_table()
         async with db.pool.connection() as conn:
             cur = await conn.execute("SELECT count(*) FROM chunk")
             (count,) = await cur.fetchone()
         if count == 0:
             await _ingest_corpus(db, chunker, corpus_dir)
-        yield db
+        yield BatchedRagDb(db)
 
     if request.config.getoption("--drop-eval-db"):
         _drop_eval_db(settings, eval_dsn)
 
 
-@pytest_asyncio.fixture(scope="session")
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def eval_db(
     request,
     settings: Settings,
@@ -239,11 +247,13 @@ async def eval_db(
         overlap_tokens=settings.chunk_overlap_tokens,
         breadcrumb_tokens=settings.chunk_breadcrumb_tokens,
     )
-    async for db in _eval_db(request, settings, eval_dsn, embedder, chunker, corpus_dir):
+    async for db in _eval_db(
+        request, settings, eval_dsn, embedder, chunker, corpus_dir
+    ):
         yield db
 
 
-@pytest_asyncio.fixture(scope="session")
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def eval_db_no_breadcrumb(
     request,
     settings: Settings,
@@ -266,7 +276,7 @@ async def eval_db_no_breadcrumb(
         yield db
 
 
-@pytest_asyncio.fixture(scope="session")
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def eval_db_fixed_size(
     request,
     settings: Settings,

@@ -1,8 +1,16 @@
 import asyncio
 
+from huggingface_hub import scan_cache_dir
 from sentence_transformers import SentenceTransformer
 
 from models import Embedder
+
+
+def _is_cached(model: str) -> bool:
+    return any(
+        repo.repo_type == "model" and repo.repo_id == model
+        for repo in scan_cache_dir().repos
+    )
 
 
 class HfTokenizer:
@@ -70,7 +78,13 @@ class SenTranEmbedder(Embedder):
         self.query_prefix = query_prefix
         self.document_prefix = document_prefix
         self.batch_size = batch_size
-        self.transformer = SentenceTransformer(model)
+        # sentence-transformers otherwise checks the Hub for updates on
+        # every load, even when the model is already cached - dozens of
+        # live HTTP round-trips (redirects included) per instantiation for
+        # no benefit once the model is already on disk.
+        self.transformer = SentenceTransformer(
+            model, local_files_only=_is_cached(model)
+        )
         # get_sentence_embedding_dimension was renamed to get_embedding_dimension;
         # fall back to the old name for sentence-transformers versions that
         # predate the rename.

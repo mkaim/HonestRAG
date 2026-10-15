@@ -18,7 +18,7 @@ def encoded(monkeypatch, hf_tokenizer) -> list[str]:
         tokenizer = hf_tokenizer
         max_seq_length = MAX_SEQ_LENGTH
 
-        def __init__(self, model: str):
+        def __init__(self, model: str, local_files_only: bool = False):
             pass
 
         def get_embedding_dimension(self) -> int:

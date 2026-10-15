@@ -20,10 +20,22 @@ list - a dataset without tiers runs once with tier=None.
 
 import time
 
+import pytest
+
 from fusion import RRF
 from models import SearchMode
 from rag import Rag
 from tests.eval.golden import load_gold, mean_reciprocal_rank, recall_at_budget
+
+# eval_db* fixtures are session-scoped (ingest is too expensive to redo per
+# test) and opened on the session event loop (see conftest.py's
+# loop_scope="session" fixtures). pytest-asyncio otherwise runs each test
+# on its own function-scoped loop by default, which would mismatch the
+# fixture's loop - defensive, not a fix for any bug actually seen so far
+# (see tests/eval/README.md's PoolTimeout writeup for what the real fix
+# was), but a session-scoped async fixture shared across many tests is a
+# documented footgun worth avoiding regardless.
+pytestmark = pytest.mark.asyncio(loop_scope="session")
 
 # Token budgets to report Recall@ under - same idea as Recall@k, but metered
 # by context size (what an LLM would actually be fed) rather than chunk
@@ -65,7 +77,9 @@ async def test_baseline_single_modes(eval_db, gold_file, tier):
             mode, [q.question for q in questions], limit=RETRIEVAL_LIMIT
         )
         elapsed = time.perf_counter() - start
-        _report(f"baseline: {mode.value} / {tier}", questions, rankings, tokenizer, elapsed)
+        _report(
+            f"baseline: {mode.value} / {tier}", questions, rankings, tokenizer, elapsed
+        )
 
 
 async def test_fusion_improves_on_single_modes(eval_db, gold_file, tier):
@@ -95,13 +109,17 @@ async def test_breadcrumb_effect_on_semantic_search(
         SearchMode.SEMANTIC, [q.question for q in questions], limit=RETRIEVAL_LIMIT
     )
 
-    _report(f"semantic, with breadcrumb / {tier}", questions, with_breadcrumb, tokenizer)
+    _report(
+        f"semantic, with breadcrumb / {tier}", questions, with_breadcrumb, tokenizer
+    )
     _report(
         f"semantic, no breadcrumb / {tier}", questions, without_breadcrumb, tokenizer
     )
 
 
-async def test_block_chunker_vs_fixed_size(eval_db, eval_db_fixed_size, gold_file, tier):
+async def test_block_chunker_vs_fixed_size(
+    eval_db, eval_db_fixed_size, gold_file, tier
+):
     """Unlike the breadcrumb comparison, FixedSizeChunker changes chunk
     boundaries themselves (content, not just embedding_text), so both BM25
     and semantic search are affected here - this isolates what
@@ -121,7 +139,9 @@ async def test_block_chunker_vs_fixed_size(eval_db, eval_db_fixed_size, gold_fil
         fixed_size = await eval_db_fixed_size.search(
             mode, [q.question for q in questions], limit=RETRIEVAL_LIMIT
         )
-        _report(f"{mode.value}, BlockChunker / {tier}", questions, block_chunked, tokenizer)
+        _report(
+            f"{mode.value}, BlockChunker / {tier}", questions, block_chunked, tokenizer
+        )
         _report(
             f"{mode.value}, FixedSizeChunker / {tier}",
             questions,
