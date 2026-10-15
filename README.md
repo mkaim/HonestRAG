@@ -16,6 +16,53 @@ answered by any OpenAI-compatible LLM (OpenAI, LM Studio, Ollama, etc.).
   endpoint — configure `RAG_LLM_BASE_URL`/`RAG_LLM_API_KEY`/`RAG_LLM_MODEL`.
 - **Access**: a single-page web UI, served by FastAPI.
 
+## Verification pipeline
+
+Each question runs through four stages, streamed to the UI as they
+complete (`server.py`'s `_ask_stream`):
+
+1. **Decompose** (`llm/roles/decomposer.py`) - the question is split into
+   one or more focused sub-questions, each phrased to stand alone (no
+   pronouns referring to context outside itself). A multi-part question
+   answered and verified as one blob would blur which part is actually
+   supported; decomposing keeps grounding precise per sub-question rather
+   than per prompt.
+2. **Retrieve** (`rag.py`) - every sub-question is searched against both
+   BM25 and semantic search, fused with RRF (see
+   [Why hybrid BM25 + semantic search](#why-hybrid-bm25--semantic-search)
+   below). Chunks are pooled and deduplicated across all sub-questions
+   before being handed to the answerer.
+3. **Answer** (`llm/roles/answerer.py`) - for each sub-question, the model
+   lists atomic facts, each citing the id of the one chunk it came from
+   plus a verbatim quote copied from that chunk, then writes that
+   sub-question's answer from those facts alone. A final answer
+   synthesizes the sub-answers; it is instructed to say nothing the
+   sub-answers don't already say. If the context contradicts a premise the
+   question assumed, the answerer is told to say so explicitly rather than
+   silently answer the assumption.
+4. **Verify** (`llm/roles/verifier.py`) - a second, independent LLM pass
+   judges each fact: does its quote *entail* the statement (not just
+   relate to it), scored yes/partial/no, and separately flags any sentence
+   in the final answer not entailed by any fact above (whether it
+   contradicts the sources or just adds something unsupported).
+5. **Check completeness** (`llm/roles/completeness.py`) - a third
+   independent LLM pass judges, per sub-question, whether it's covered,
+   correctly declined as not in the sources, or missed - strict about
+   matching the question's specifics (timeframes, quantities, named
+   entities), so a related-but-different answer counts as missed.
+
+Every stage that cites a quote (answerer, verifier, completeness checker
+alike) has that quote checked in code against the chunk it claims to cite
+(`llm/agent.py`'s `quote_in_chunk`): normalized for whitespace/quote
+marks, tolerant of an ellipsis skipping to a later verbatim span, but
+otherwise requiring the quote to actually appear in that chunk's text.
+**A verifier is just another LLM call and can hallucinate its own
+supporting quote**, so the verifier's "yes" and the completeness
+checker's "covered" are themselves downgraded (to "no"/"missed")
+whenever their own cited quote fails this check - the system never trusts
+an LLM's self-report of its own grounding, including the LLM whose job is
+to check grounding.
+
 ## Requirements
 
 - Docker (and Docker Compose)
@@ -81,6 +128,76 @@ the plain content; the text that gets embedded additionally carries:
 If content + overlap + breadcrumb would exceed the embedding model's input
 limit, the content budget is lowered automatically (with a warning).
 Changing these only affects documents ingested afterwards.
+
+## Design decisions
+
+#### Why hybrid BM25 + semantic search
+
+The two fail in opposite ways. BM25 misses paraphrases and conceptual
+matches - ask about "the fee" when the text says "the charge" and a
+lexical match finds nothing. Semantic search misses exact literal strings
+- an ID, a product code, an uncommon proper name - because an embedding
+model generalizes meaning at the cost of exact tokens. For a system that
+is built to admit uncertainty rather than guess, relying on only one mode
+leaves a blind spot that would surface as "the data doesn't support an
+answer" when the data was actually there, just missed by that mode. The
+two rankings are merged with Reciprocal Rank Fusion (`fusion/rrf.py`)
+rather than picking one.
+
+#### Why decompose into sub-questions before answering
+
+Users often ask multi-part questions in one prompt ("when was X founded
+and who led it"). Answering and verifying the whole prompt as one unit
+would blur which part is actually grounded - a confident, well-supported
+answer to one part and a guess on the other would look like one verified
+answer. Decomposing first keeps each claim traceable to its own
+sub-question, its own retrieval, and its own citation.
+
+#### Why two separate LLM passes (answer, then verify) instead of one
+
+Built with small, local models (Qwen-class) in mind, not just large
+hosted ones. Asking a single pass to both answer a multi-part question
+*and* critically judge its own citations in one go asks more reasoning
+depth per response than a smaller model reliably gives. Splitting answer
+and verification into separate calls keeps each prompt's job narrow -
+"answer from these facts" is a different, simpler task than "judge
+whether this quote actually entails this statement" - which a smaller
+model can do reliably even when it couldn't do both at once.
+
+#### Why the verifier's own citations aren't trusted either
+
+A verifier is just another LLM call, and an LLM call can hallucinate a
+quote as easily when checking an answer as when writing one. Honoring the
+verifier's "yes" or "covered" verdict just because the model said so would
+only move the trust problem one level up, not solve it. So every quote
+the verifier (or the completeness checker) cites for its own verdict goes
+through the same deterministic `quote_in_chunk` check the answerer's
+quotes do - a verdict backed by a quote that doesn't actually appear in
+the chunk is downgraded, regardless of how confident the model sounded.
+
+## Known limitations
+
+- **No cross-chunk contradiction detection.** Verification checks a fact
+  against the one chunk it cites, not against other retrieved chunks that
+  might conflict with it. If two chunks disagree with each other (e.g.
+  different documents quoting different figures for the same thing), the
+  pipeline has no dedicated mechanism to notice or surface that - at most,
+  an LLM judging entailment might incidentally notice something's off, but
+  that's not a designed check.
+- **No batching or progressive synthesis for very large multi-question
+  prompts.** All sub-questions are answered and verified in a single pass
+  today. Kept simple deliberately, until that approach actually shows a
+  real limit (context size, latency, or quality degrading as sub-question
+  count grows) worth solving for.
+
+## How this was built
+
+A self-directed learning project: started solo, for the sake of learning
+RAG systems end to end, then extended with an AI coding agent (Claude
+Code) under direct supervision for specific pieces - the markdown loader,
+the fixed-size-chunker baseline and retrieval eval harness, a couple of
+chunker bug fixes - each reviewed and directed step by step rather than
+delegated wholesale.
 
 ## Tests
 
