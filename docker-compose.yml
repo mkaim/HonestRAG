@@ -28,6 +28,7 @@ services:
       RAG_LLM_BASE_URL: ${RAG_LLM_BASE_URL}
       RAG_LLM_API_KEY: ${RAG_LLM_API_KEY}
       RAG_LLM_MODEL: ${RAG_LLM_MODEL}
+      RAG_LLM_SIMPLIFIED_SCHEMA_INSTRUCTIONS: ${RAG_LLM_SIMPLIFIED_SCHEMA_INSTRUCTIONS:-false}
       RAG_DEBUG: ${RAG_DEBUG:-false}
     volumes:
       # Keeps downloaded embedding models across rebuilds and recreates.

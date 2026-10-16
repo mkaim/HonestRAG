@@ -43,13 +43,7 @@ from rag import Rag
 TOP_K = 10
 
 cfg = Settings()
-agent = build_agent(
-    cfg.llm_base_url,
-    cfg.llm_api_key,
-    cfg.llm_model,
-    structured_output_mode=cfg.llm_structured_output_mode,
-    native_output_requires_schema_in_instructions=cfg.llm_native_output_requires_schema_in_instructions,
-)
+agent = build_agent(cfg.llm_base_url, cfg.llm_api_key, cfg.llm_model)
 
 embedder = SenTranEmbedder(
     cfg.embed_model,
@@ -157,7 +151,7 @@ def _final(
 async def _ask_stream(question: str) -> AsyncIterator[str]:
     """Runs the pipeline - decompose, search, answer, verify, completeness -
     streaming a 'running' and a 'done' event per stage, then 'final'."""
-    decomposer = Decomposer(agent)
+    decomposer = Decomposer(agent, cfg.llm_simplified_schema_instructions)
     yield _sse(decomposer.NAME, "running")
     decomposed = await decomposer.run(
         format_query_prefix(question), {}, debug=cfg.debug
@@ -191,7 +185,7 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
 
     prompt_prefix = format_prompt_prefix(question, chunks, questions)
 
-    answerer = Answerer(agent)
+    answerer = Answerer(agent, cfg.llm_simplified_schema_instructions)
     yield _sse(answerer.NAME, "running")
     answered = await answerer.run(prompt_prefix, contents, debug=cfg.debug)
     yield _role_done(answerer, answered)
@@ -199,12 +193,12 @@ async def _ask_stream(question: str) -> AsyncIterator[str]:
     # The verifier and completeness checker both judge the answer.
     prompt_prefix += format_answer_suffix(answered.output)
 
-    verifier = Verifier(agent)
+    verifier = Verifier(agent, cfg.llm_simplified_schema_instructions)
     yield _sse(verifier.NAME, "running")
     verified = await verifier.run(prompt_prefix, contents, debug=cfg.debug)
     yield _role_done(verifier, verified)
 
-    checker = CompletenessChecker(agent)
+    checker = CompletenessChecker(agent, cfg.llm_simplified_schema_instructions)
     yield _sse(checker.NAME, "running")
     checked = await checker.run(prompt_prefix, contents, debug=cfg.debug)
     yield _role_done(checker, checked)

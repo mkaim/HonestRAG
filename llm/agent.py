@@ -2,9 +2,8 @@ import re
 from dataclasses import dataclass
 
 from pydantic import BaseModel
-from pydantic_ai import Agent
+from pydantic_ai import Agent, NativeOutput
 from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.profiles import ModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 
 SYSTEM_PROMPT = (
@@ -14,23 +13,77 @@ SYSTEM_PROMPT = (
 )
 
 
-def build_agent(
-    base_url: str,
-    api_key: str,
-    model: str,
-    *,
-    structured_output_mode: str = "native",
-    native_output_requires_schema_in_instructions: bool = True,
-) -> Agent:
+def build_agent(base_url: str, api_key: str, model: str) -> Agent:
     provider = OpenAIProvider(base_url=base_url, api_key=api_key)
-    profile = ModelProfile(
-        default_structured_output_mode=structured_output_mode,
-        native_output_requires_schema_in_instructions=native_output_requires_schema_in_instructions,
-    )
     return Agent(
-        OpenAIChatModel(model, provider=provider, profile=profile),
-        system_prompt=SYSTEM_PROMPT,
+        OpenAIChatModel(model, provider=provider), system_prompt=SYSTEM_PROMPT
     )
+
+
+def describe_output_fields(model: type[BaseModel]) -> str:
+    """A JSON skeleton for `model` with a `// comment` per field, in place
+    of pydantic-ai's default schema instructions (raw JSON Schema, with
+    $ref/$defs indirection for nested models) - meant to be easier for a
+    model to read than JSON Schema, especially a smaller/local one, while
+    staying closer to the JSON shape it must actually produce than a prose
+    field list would. Only handles the shapes this project's own Output
+    models actually use: flat string/array fields, string enums, and one
+    level of nesting via $ref - not a general JSON Schema renderer."""
+    schema = model.model_json_schema()
+    defs = schema.get("$defs", {})
+    skeleton = "\n".join(_render_object(schema, defs, indent=""))
+    return (
+        "Respond with a single JSON object matching this structure - no "
+        f"other text, no Markdown fencing:\n{skeleton}"
+    )
+
+
+def _render_object(obj_schema: dict, defs: dict, indent: str) -> list[str]:
+    """Lines for a JSON object, e.g. ['{', '  "a": "...",', '  "b": "..."', '}'].
+    Every returned line already carries its own full indent (including the
+    first and last) - callers that place this inline after a key (as
+    `_render_value` does) must strip the leading indent of line 0
+    themselves, since that line continues the `"key": ` on its own line."""
+    required = set(obj_schema.get("required", []))
+    inner = indent + "  "
+    lines = [f"{indent}{{"]
+    props = list(obj_schema.get("properties", {}).items())
+    for i, (name, prop) in enumerate(props):
+        is_last = i == len(props) - 1
+        value_lines = _render_value(prop, defs, inner)
+        value_lines[0] = f'{inner}"{name}": {value_lines[0]}'
+        value_lines[-1] += "" if is_last else ","
+        value_lines[-1] += _trailing_comment(prop, optional=name not in required)
+        lines.extend(value_lines)
+    lines.append(f"{indent}}}")
+    return lines
+
+
+def _render_value(prop: dict, defs: dict, indent: str) -> list[str]:
+    """Lines for one field's value, meant to be placed right after `"key": `
+    - line 0 carries no indent of its own (it continues that line); every
+    other line is already indented at `indent` or deeper."""
+    if "$ref" in prop:
+        lines = _render_object(defs[prop["$ref"].rsplit("/", 1)[-1]], defs, indent)
+        return [lines[0].removeprefix(indent), *lines[1:]]
+    if prop.get("type") == "array":
+        item_lines = _render_value(prop["items"], defs, indent + "  ")
+        return [
+            "[",
+            f"{indent}  {item_lines[0]}",
+            *item_lines[1:],
+            f"{indent}]",
+        ]
+    if "enum" in prop:
+        return [" | ".join(f'"{v}"' for v in prop["enum"])]
+    return ['"..."']
+
+
+def _trailing_comment(prop: dict, *, optional: bool) -> str:
+    parts = [prop["description"]] if prop.get("description") else []
+    if optional:
+        parts.append("optional")
+    return f"  // {' - '.join(parts)}" if parts else ""
 
 
 @dataclass(frozen=True)
@@ -48,8 +101,12 @@ class Role[T: BaseModel]:
     SUFFIX: str
     Output: type[T]
 
-    def __init__(self, agent: Agent):
+    def __init__(self, agent: Agent, simplified_schema: bool = False):
         self.agent = agent
+        # Local providers don't include the output schema in what the
+        # model reads, so simplified_schema appends our own JSON-skeleton
+        # field description (describe_output_fields) to the prompt instead.
+        self.simplified_schema = simplified_schema
 
     def verify(self, output: T, contents: dict[str, str]) -> object | None:
         """Deterministic, code-level check of `output` against each cited
@@ -67,7 +124,12 @@ class Role[T: BaseModel]:
         debug: bool = False,
     ) -> RoleResult[T]:
         prompt = prompt_prefix + self.SUFFIX
-        result = await self.agent.run(prompt, output_type=self.Output)
+        if self.simplified_schema:
+            prompt += f"\n\n{describe_output_fields(self.Output)}"
+            output_type = NativeOutput(self.Output, template=False)
+        else:
+            output_type = NativeOutput(self.Output)
+        result = await self.agent.run(prompt, output_type=output_type)
         verification = self.verify(result.output, contents)
         raw_messages = result.new_messages_json().decode() if debug else None
         return RoleResult(

@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from pydantic_ai import NativeOutput
 
 import server
 from llm.roles.answerer import AnswerOutput, Fact, SubAnswer
@@ -46,8 +47,10 @@ OUTPUTS = {
 
 class FakeAgent:
     async def run(self, prompt: str, output_type):
+        # Role.run always passes NativeOutput(Output, ...) - unwrap it.
+        assert isinstance(output_type, NativeOutput)
         return SimpleNamespace(
-            output=OUTPUTS[output_type], new_messages_json=lambda: b"[]"
+            output=OUTPUTS[output_type.outputs], new_messages_json=lambda: b"[]"
         )
 
 

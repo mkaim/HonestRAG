@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     llm_base_url: str
     llm_api_key: str
     llm_model: str
-    llm_structured_output_mode: str = "native"
-    llm_native_output_requires_schema_in_instructions: bool = True
+    # Local providers don't include the output schema in what the model
+    # reads.
+    llm_simplified_schema_instructions: bool = False
     debug: bool = False
