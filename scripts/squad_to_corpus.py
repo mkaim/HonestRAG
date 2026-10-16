@@ -16,6 +16,13 @@ pipeline says "unsupported" instead of guessing. This script writes one
 .txt file per article (paragraphs joined in order) and a separate
 questions.json (not ingested) with each question's text and whether SQuAD
 considers it answerable, for comparing against HonestRAG's own verdict.
+
+Also writes gold.json in the generic format tests/eval/golden.py reads
+(see scripts/fetch_dnd_srd.py), so this corpus can run through
+tests/eval's retrieval-quality tests like the markdown ones - a flat,
+plain-text corpus with no real headers, the opposite structural extreme
+from both. Only answerable questions (`is_impossible: false`) go in
+gold.json, since an unanswerable one has no real passage to rank.
 """
 
 import argparse
@@ -34,6 +41,7 @@ def convert(squad_path: Path, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     questions = []
+    gold = []
     for article in data:
         slug = _slugify(article["title"])
         paragraphs = [p["context"] for p in article["paragraphs"]]
@@ -41,19 +49,33 @@ def convert(squad_path: Path, out_dir: Path) -> None:
 
         for paragraph in article["paragraphs"]:
             for qa in paragraph["qas"]:
+                answers = [a["text"] for a in qa["answers"]]
                 questions.append(
                     {
                         "id": qa["id"],
                         "document": slug,
                         "question": qa["question"],
                         "is_impossible": qa["is_impossible"],
-                        "answers": [a["text"] for a in qa["answers"]],
+                        "answers": answers,
                     }
                 )
+                if not qa["is_impossible"]:
+                    gold.append(
+                        {
+                            "question": qa["question"],
+                            "answer": answers[0],
+                            "passages": [
+                                {"content": text, "document": f"{slug}.txt"}
+                                for text in dict.fromkeys(answers)
+                            ],
+                        }
+                    )
 
     (out_dir / "questions.json").write_text(json.dumps(questions, indent=2))
+    (out_dir / "gold.json").write_text(json.dumps(gold, indent=2))
     print(
-        f"Wrote {len(data)} document(s) and {len(questions)} question(s) to {out_dir}"
+        f"Wrote {len(data)} document(s), {len(questions)} question(s) "
+        f"({len(gold)} answerable) to {out_dir}"
     )
 
 

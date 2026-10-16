@@ -34,7 +34,6 @@ from pathlib import Path
 
 from models import SearchResult, Tokenizer
 
-
 _QUOTES_RE = re.compile(r"[\"'“”‘’]")
 
 
@@ -79,7 +78,10 @@ def load_gold(gold_path: Path, tier: str | None = None) -> list[GoldQuestion]:
 
 
 def is_hit(passage: GoldPassage, result: SearchResult) -> bool:
-    if result.chunk.document_id != passage.document:
+    # Suffix match, not equality: a corpus ingested by path (e.g. ingest.py
+    # on the live app, which stores the full file path as document_id)
+    # still matches gold.json's bare filename.
+    if not result.chunk.document_id.endswith(passage.document):
         return False
     gold = _normalize(passage.content)
     chunk = _normalize(result.chunk.content)
@@ -145,3 +147,38 @@ def mean_reciprocal_rank(
         if found:
             scores.append(1 / min(found))
     return sum(scores) / len(questions) if questions else 0.0
+
+
+# Bucket boundaries for rank_distribution, paired with their labels - the
+# last bucket is "found, but beyond this" and a separate not-found count is
+# always reported alongside.
+_RANK_BUCKETS = [(10, "1-10"), (30, "11-30"), (100, "31-100")]
+
+
+def rank_distribution(
+    questions: list[GoldQuestion], rankings: list[list[SearchResult]]
+) -> dict[str, int]:
+    """Where each question's best-ranked gold passage actually lands, in a
+    deep ranking (callers should pass a large `limit` to search() - rank
+    looks no deeper than what's in `rankings`). Unlike recall_at_budget/MRR,
+    which summarize into one number, this shows the shape of the failures:
+    whether a model is uniformly mediocre or bimodal (nails most questions,
+    badly misses a consistent minority) only shows up in the distribution,
+    not the average."""
+    buckets = {label: 0 for _, label in _RANK_BUCKETS}
+    buckets[f"{_RANK_BUCKETS[-1][0] + 1}+"] = 0
+    buckets["not found"] = 0
+    for question, ranking in zip(questions, rankings, strict=True):
+        ranks = [gold_rank(p, ranking) for p in question.passages]
+        found = [r for r in ranks if r is not None]
+        if not found:
+            buckets["not found"] += 1
+            continue
+        best = min(found)
+        for ceiling, label in _RANK_BUCKETS:
+            if best <= ceiling:
+                buckets[label] += 1
+                break
+        else:
+            buckets[f"{_RANK_BUCKETS[-1][0] + 1}+"] += 1
+    return buckets

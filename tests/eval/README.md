@@ -3,9 +3,9 @@
 Measures retrieval/ranking quality on a realistic corpus, instead of
 guessing from unit tests alone. Not collected by default `pytest` - slow,
 needs a reachable Postgres and a real embedding model. Generic: works
-against any directory of markdown files plus a matching gold Q&A JSON, not
-one fixed dataset - see `golden.py` for the gold format and `conftest.py`
-for the `--corpus-dir`/`--gold-file` options.
+against any directory of `.md` or `.txt` files plus a matching gold Q&A
+JSON, not one fixed dataset - see `golden.py` for the gold format and
+`conftest.py` for the `--corpus-dir`/`--gold-file` options.
 
 ```bash
 set -a; source .env; set +a
@@ -59,6 +59,19 @@ dataset-level (GutenQA's gold text occasionally paraphrases or elides a
 narration interruption mid-sentence - e.g. "You will be haunted by Three
 Spirits" vs. the actual text's "You will be haunted," resumed the Ghost,
 "by Three Spirits), not a conversion bug.
+
+**SQuAD 2.0** (`scripts/squad_to_corpus.py`, from
+[rajpurkar.github.io/SQuAD-explorer](https://rajpurkar.github.io/SQuAD-explorer/),
+CC-BY-SA 4.0): 35 Wikipedia articles as flat `.txt` (one per article,
+paragraphs joined, no headers at all) - the opposite structural extreme
+from both markdown corpora, and the reason the eval harness grew `.txt`
+support (see `conftest.py`'s `_LOADERS`) rather than staying markdown-only.
+5928 answerable questions (SQuAD also has ~5945 deliberately unanswerable
+ones, `is_impossible: true`, kept in `questions.json` for the separate
+answer/verify pipeline eval the original script's docstring describes, but
+excluded from `gold.json` - there's no real passage to rank for those).
+Gold passages are SQuAD's own short exact-match answer spans (e.g.
+"France"), already guaranteed to appear verbatim in their article.
 
 ## Findings log
 
@@ -442,3 +455,90 @@ regardless of corpus structure.
 RRF fusion beats both single modes here too (MRR 0.612 vs. BM25's 0.604
 and semantic's 0.530), same pattern as every other corpus/model
 combination tried so far - hybrid retrieval earns its keep consistently.
+
+### 2026-10-16 — where semantic search actually ranks the gold passage, on e5-base
+
+Prompted by a live-app miss: asking "What reasons does Elizabeth Bennet
+believe were the cause of Mr. Darcy's actions towards Jane and Mr.
+Bingley?" against the production DB (GutenQA, e5-base), the pipeline
+correctly said the sources didn't cover it - but the gold passage ("his
+pride and caprice were the cause... of all that Jane had suffered")
+genuinely exists in the corpus, names Darcy/Jane/Bingley explicitly, and
+still ranked **67th** in semantic search. Worth checking whether this was
+a one-off or representative, since the live app's `TOP_K` is 10.
+
+Ran semantic search for all 480 GutenQA questions, found each gold
+passage's rank in a 500-deep ranking (matching by document suffix + text
+containment, not exact offsets):
+
+| Rank bucket | Questions | % |
+|---|---|---|
+| 1-10 | 360 | 75.0% |
+| 11-30 | 51 | 10.6% |
+| 31-100 | 31 | 6.5% |
+| 101-500 | 10 | 2.1% |
+| not found in top 500 | 28 | 5.8% |
+
+So the Pride and Prejudice case wasn't a fluke - it's representative of a
+real ~19% tail (ranks 11-500) plus another ~6% that don't surface at all
+in the top 500, where e5-base's semantic ranking puts a textually-relevant,
+entity-matching passage far outside any retrieval budget the live app
+could reasonably afford. The other 75% land comfortably within `TOP_K`.
+
+This matches the aggregate Recall@k numbers measured earlier in this file
+(e.g. Recall@500tok ≈ 0.44 for semantic alone) but makes the shape of the
+failure concrete: it's not that the model is uniformly mediocre - it's
+sharply bimodal, nailing most questions and badly missing a consistent
+minority, with the misses not obviously explained by vocabulary overlap
+(the missed passage here shared the question's key named entities).
+
+Not yet checked: whether BM25 or RRF fusion recovers any of the ranks
+11-500/not-found cases (they fail differently, so some may already be
+covered by fusion in practice).
+
+### 2026-10-16 — the same tail, across all three corpora
+
+Generalized `rank_distribution` (now in `golden.py`, used by
+`test_semantic_rank_distribution`) and the eval harness's corpus loading
+(it was markdown-only; now also reads `.txt` via `_LOADERS`, matching
+`ingest.py`'s own convention) specifically to run this same check against
+SRD and SQuAD too, not just GutenQA - is the long tail found above a
+property of this one corpus, or does it show up everywhere on e5-base?
+Also fixed a real bug surfaced while building this: `golden.is_hit`
+compared `chunk.document_id` by exact equality, which silently breaks (zero
+hits, no error) against a corpus ingested by full file path rather than
+bare filename - exactly what the live app's `ingest.py` does. Now compares
+by suffix instead.
+
+All three on `multilingual-e5-base`, semantic search, rank of each
+question's best-matching gold passage in a 500-deep ranking:
+
+| Rank bucket | SRD (easy, 25q) | SRD (medium, 31q) | GutenQA (480q) | SQuAD (5928q) |
+|---|---|---|---|---|
+| 1-10 | 96.0% | 67.7% | 75.0% | 97.4% |
+| 11-30 | 0.0% | 3.2% | 10.6% | 1.9% |
+| 31-100 | 4.0% | 16.1% | 6.5% | 0.6% |
+| 101+ | 0.0% | 9.7% | 2.1% | 0.1% |
+| not found (in top 500) | 0.0% | 3.2% | 5.8% | 0.0% |
+
+**SQuAD is dramatically better-behaved than either markdown corpus** -
+97.4% in the top 10, essentially no long tail at all. The two markdown
+corpora both show the same bimodal pattern from the GutenQA finding above
+(nail most questions, badly miss a real minority), SRD's medium tier
+being the worst of the four (32% outside the top 10, nearly a third).
+
+The likely reason isn't "e5-base is bad at retrieval" in general - it's
+that SQuAD's questions are literal, single-fact, Wikipedia-style ("In what
+country is Normandy located?" → "France" appears verbatim nearby) with
+short, exact-match gold spans; the markdown corpora's questions
+(GutenQA's "what reasons... caused X", SRD's multi-hop "medium" tier) ask
+for synthesis or implicit causality the gold passage doesn't phrase the
+same way the question does. That's a harder retrieval problem on its own
+terms, not necessarily something a different/bigger embedding model fixes
+- consistent with e5-large already failing to beat e5-base on SRD earlier
+in this log. Worth testing deliberately as a separate, explicitly
+diagnostic comparison (not a step toward adopting it in production, which
+stays multilingual): an English-only model of similar size to e5-base,
+to see whether some of this gap is multilingual capacity being spent on
+languages this corpus doesn't use, rather than a retrieval-difficulty
+ceiling no model-size change would move.

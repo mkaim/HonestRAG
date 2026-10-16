@@ -35,7 +35,7 @@ from chunkers import BlockChunker, FixedSizeChunker
 from config import Settings
 from db import PsqlRagDb
 from embedders import SenTranEmbedder
-from loaders import MarkdownFileLoader
+from loaders import MarkdownFileLoader, TextFileLoader
 from models import Chunk, Chunker, Document
 from tests.eval.batching import BatchedRagDb
 
@@ -179,10 +179,16 @@ def _drop_eval_db(settings: Settings, eval_dsn: str) -> None:
         conn.execute(f'DROP DATABASE IF EXISTS "{dbname}"')
 
 
+#  .md gets real header-aware loading; .txt (e.g. the SQuAD example, which
+# has no markdown structure) falls back to blank-line paragraphs - same
+# convention as ingest.py's own LOADERS.
+_LOADERS = {".md": MarkdownFileLoader(), ".txt": TextFileLoader()}
+
+
 async def _ingest_corpus(db: PsqlRagDb, chunker: Chunker, corpus_dir: Path) -> None:
-    loader = MarkdownFileLoader()
-    for path in sorted(corpus_dir.glob("*.md")):
-        blocks, metadata = loader.load(str(path))
+    paths = sorted(p for p in corpus_dir.iterdir() if p.suffix in _LOADERS)
+    for path in paths:
+        blocks, metadata = _LOADERS[path.suffix].load(str(path))
         document = Document(id=path.name, metadata=metadata)
         chunks: list[Chunk] = list(chunker.chunk(document.id, blocks))
         await db.add(document, chunks)

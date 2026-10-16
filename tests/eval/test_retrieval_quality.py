@@ -25,7 +25,12 @@ import pytest
 from fusion import RRF
 from models import SearchMode
 from rag import Rag
-from tests.eval.golden import load_gold, mean_reciprocal_rank, recall_at_budget
+from tests.eval.golden import (
+    load_gold,
+    mean_reciprocal_rank,
+    rank_distribution,
+    recall_at_budget,
+)
 
 # eval_db* fixtures are session-scoped (ingest is too expensive to redo per
 # test) and opened on the session event loop (see conftest.py's
@@ -148,3 +153,28 @@ async def test_block_chunker_vs_fixed_size(
             fixed_size,
             tokenizer,
         )
+
+
+# How deep to search when characterizing where gold passages actually rank
+# (test_semantic_rank_distribution) - deep enough to tell "ranks low" apart
+# from "doesn't surface at all", unlike the shallow RETRIEVAL_LIMIT used for
+# the budget-based Recall/MRR reports above.
+DEEP_RETRIEVAL_LIMIT = 500
+
+
+async def test_semantic_rank_distribution(eval_db, gold_file, tier):
+    """Recall@budget/MRR summarize into one number; this shows the shape of
+    the misses instead - whether semantic search is uniformly mediocre or
+    bimodal (nails most questions, badly misses a consistent minority).
+    Prompted by a live-app case where a textually-relevant, entity-matching
+    passage still ranked far outside any reasonable retrieval budget - see
+    tests/eval/README.md."""
+    questions = load_gold(gold_file, tier)
+    rankings = await eval_db.search(
+        SearchMode.SEMANTIC, [q.question for q in questions], limit=DEEP_RETRIEVAL_LIMIT
+    )
+    distribution = rank_distribution(questions, rankings)
+
+    print(f"\n--- semantic rank distribution / {tier} ({len(questions)} questions) ---")
+    for label, count in distribution.items():
+        print(f"  {label}: {count} ({100 * count / len(questions):.1f}%)")
