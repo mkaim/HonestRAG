@@ -2,12 +2,20 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_search;
 
 -- One row per ingested source. Holds source-level metadata (author, title,
--- ...) once, instead of duplicating it onto every chunk.
+-- ...) once, instead of duplicating it onto every chunk. external_id is
+-- unique only among active rows (not a plain UNIQUE constraint) so a
+-- re-ingest can build its replacement as an inactive row under the same
+-- external_id, then atomically flip active old->off/new->on, with no
+-- window where search (which filters on active) sees zero or two rows.
 CREATE TABLE document (
     id           BIGSERIAL PRIMARY KEY,
-    external_id  TEXT NOT NULL UNIQUE,
-    metadata     JSONB NOT NULL DEFAULT '{}'::jsonb
+    external_id  TEXT NOT NULL,
+    metadata     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    active       BOOLEAN NOT NULL DEFAULT true
 );
+
+CREATE UNIQUE INDEX document_external_id_active_uidx
+    ON document (external_id) WHERE active;
 
 -- One row per retrieval unit. external_id is Chunk.id ("{document_id}#{index}").
 CREATE TABLE chunk (

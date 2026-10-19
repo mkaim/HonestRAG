@@ -1,5 +1,6 @@
 import asyncio
 import re
+import uuid
 
 from pgvector import Vector
 from pgvector.psycopg import register_vector_async
@@ -14,6 +15,7 @@ SELECT doc.external_id, c.chunk_index, c.text, c.metadata,
 FROM chunk c
 JOIN document doc ON doc.id = c.document_id
 WHERE c.id @@@ paradedb.match('text', %(query)s)
+  AND doc.active
 ORDER BY score DESC
 LIMIT %(limit)s
 """
@@ -25,18 +27,42 @@ SELECT doc.external_id, c.chunk_index, c.text, c.metadata,
 FROM {embed_table} e
 JOIN chunk c ON c.id = e.chunk_id
 JOIN document doc ON doc.id = c.document_id
+WHERE doc.active
 ORDER BY e.embedding <#> %(embedding)s
 LIMIT %(limit)s
 """
 
 # Placeholders ({table}, {dims}, {embed_table}) are derived from the embedder
 # model name/dims, never user input, so .format() interpolation is safe.
-_DOCUMENT_UPSERT_SQL = """
-INSERT INTO document (external_id, metadata)
-VALUES (%s, %s)
-ON CONFLICT (external_id)
-DO UPDATE SET metadata = EXCLUDED.metadata
+
+# Inserts the new version of a document under its real external_id, inactive
+# - never visible to search (which filters on doc.active), and not a unique
+# violation even though an active row with the same external_id may already
+# exist, since document_external_id_active_uidx only constrains active rows.
+_DOCUMENT_INSERT_STAGING_SQL = """
+INSERT INTO document (external_id, metadata, active)
+VALUES (%s, %s, false)
 RETURNING id
+"""
+
+# Flips the old active row (if any) off and the new staging row on, in one
+# transaction, so no query can ever see zero or two active rows sharing
+# external_id. The old row (and its chunks/embeddings, via ON DELETE CASCADE)
+# is deleted by id afterwards, outside any transaction - safe because an
+# inactive row is already unreachable to every search query the instant
+# this commits.
+_DOCUMENT_RETIRE_SQL = """
+UPDATE document SET active = false
+WHERE external_id = %(real_id)s AND active
+RETURNING id
+"""
+
+_DOCUMENT_PROMOTE_SQL = """
+UPDATE document SET active = true WHERE id = %(staging_row_id)s
+"""
+
+_DOCUMENT_DELETE_BY_ID_SQL = """
+DELETE FROM document WHERE id = %(old_row_id)s
 """
 
 _CHUNK_UPSERT_SQL = """
@@ -104,25 +130,39 @@ class PsqlRagDb(RagDb):
         return table
 
     async def add(self, document: Document, chunks: list[Chunk]) -> None:
+        """Builds `document` as a staging row (invisible to search, since
+        both search queries filter on doc.active) and atomically swaps it in
+        for any existing document sharing `document.id` - search never sees
+        a partially-built document, nor a window where `document.id` has no
+        active row at all. document.external_id is unique only among active
+        rows (see postgres_init.sql), so the staging row can use the real
+        document.id directly; chunk.external_id has no such exemption, so
+        staging chunks get a scratch prefix to avoid colliding with the old
+        active document's live chunks of the same name. The old version's
+        row/chunks/embeddings are deleted after the swap, which is safe
+        without a transaction: once the swap commits, nothing can select an
+        inactive row anymore."""
         if not chunks:
             return
         embeddings = await self.embedder.embed_documents(
             [c.embedding_text or c.content for c in chunks]
         )
         table = await self.ensure_vector_table()
+        chunk_scratch_prefix = f"{document.id}#staging-{uuid.uuid4().hex[:8]}"
+
         async with self.pool.connection() as conn:
             cur = await conn.execute(
-                _DOCUMENT_UPSERT_SQL,
+                _DOCUMENT_INSERT_STAGING_SQL,
                 (document.id, Jsonb(document.metadata)),
             )
-            (document_row_id,) = await cur.fetchone()
+            (staging_row_id,) = await cur.fetchone()
 
             for chunk, embedding in zip(chunks, embeddings, strict=True):
                 cur = await conn.execute(
                     _CHUNK_UPSERT_SQL,
                     (
-                        chunk.id,
-                        document_row_id,
+                        f"{chunk_scratch_prefix}#{chunk.index}",
+                        staging_row_id,
                         chunk.index,
                         chunk.content,
                         Jsonb(chunk.metadata),
@@ -132,6 +172,21 @@ class PsqlRagDb(RagDb):
                 await conn.execute(
                     _EMBEDDING_UPSERT_SQL.format(table=table),
                     (chunk_row_id, Vector(embedding)),
+                )
+
+            async with conn.transaction():
+                cur = await conn.execute(
+                    _DOCUMENT_RETIRE_SQL, {"real_id": document.id}
+                )
+                old_row = await cur.fetchone()
+                await conn.execute(
+                    _DOCUMENT_PROMOTE_SQL, {"staging_row_id": staging_row_id}
+                )
+
+            if old_row is not None:
+                (old_row_id,) = old_row
+                await conn.execute(
+                    _DOCUMENT_DELETE_BY_ID_SQL, {"old_row_id": old_row_id}
                 )
 
     async def search(
