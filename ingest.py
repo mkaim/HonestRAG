@@ -1,14 +1,16 @@
 """Ingest documents into the RAG corpus.
 
     uv run python ingest.py FILE [FILE ...]      # each file is one document
-    uv run python ingest.py --dir docs/          # every *.txt / *.md under docs/
+    uv run python ingest.py --dir docs/          # every supported file under docs/
     cat notes.txt | uv run python ingest.py -    # stdin as a single document
 
 Document id defaults to the file path (or "stdin"); pass --id to override for a
 single input. Each document is split into chunks before being added; the chunk
 retrieved and cited by the LLM is a slice of the file, not the whole file.
 .md files are parsed for real headers (#, ##, ...); .txt files are split on
-blank lines only, as plain paragraphs.
+blank lines only, as plain paragraphs; .docx headings/tables are converted to
+markdown and parsed the same way as .md; .pdf headers are inferred from font
+weight/size (see loaders/pdf.py).
 """
 
 import argparse
@@ -20,10 +22,21 @@ from chunkers import BlockChunker
 from config import Settings
 from db import PsqlRagDb
 from embedders import SenTranEmbedder
-from loaders import MarkdownFileLoader, TextFileLoader, text_to_blocks
+from loaders import (
+    DocxFileLoader,
+    MarkdownFileLoader,
+    PdfFileLoader,
+    TextFileLoader,
+    text_to_blocks,
+)
 from models import Block, Chunk, Document
 
-LOADERS = {".txt": TextFileLoader(), ".md": MarkdownFileLoader()}
+LOADERS = {
+    ".txt": TextFileLoader(),
+    ".md": MarkdownFileLoader(),
+    ".pdf": PdfFileLoader(),
+    ".docx": DocxFileLoader(),
+}
 
 
 def _collect_documents(
