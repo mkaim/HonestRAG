@@ -14,6 +14,13 @@ class RRF(RankFusion):
     def merge(
         self, rankings: list[list[SearchResult]], limit: int
     ) -> list[SearchResult]:
+        # Three separate dicts, not one dict[ChunkID, SearchResult]: each one
+        # tracks a single independent thing (the chunk itself, its prior
+        # stages' scores, this stage's running rrf total) with a one-line
+        # update per loop iteration. Collapsing them into one SearchResult
+        # that gets rebuilt every iteration was tried and reverted - it
+        # needs None-guards for the not-yet-seen case on every field, which
+        # reads worse than this, not better.
         chunks: dict[ChunkID, Chunk] = {}
         scores_by_chunk: dict[ChunkID, dict[str, float]] = {}
         rrf_scores: dict[ChunkID, float] = {}
