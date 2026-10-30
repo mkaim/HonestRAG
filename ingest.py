@@ -22,21 +22,8 @@ from chunkers import BlockChunker
 from config import Settings
 from db import PsqlRagDb
 from embedders import SenTranEmbedder
-from loaders import (
-    DocxFileLoader,
-    MarkdownFileLoader,
-    PdfFileLoader,
-    TextFileLoader,
-    text_to_blocks,
-)
+from loaders import LOADERS, text_to_blocks
 from models import Block, Chunk, Document
-
-LOADERS = {
-    ".txt": TextFileLoader(),
-    ".md": MarkdownFileLoader(),
-    ".pdf": PdfFileLoader(),
-    ".docx": DocxFileLoader(),
-}
 
 
 def _collect_documents(
