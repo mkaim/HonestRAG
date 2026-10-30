@@ -62,6 +62,9 @@
     .stage.done {
       color: #2a2;
     }
+    .stage.error {
+      color: #b3261e;
+    }
     details.debug {
       margin-top: 0.25rem;
       font-size: 0.75rem;
@@ -127,6 +130,7 @@
     />
     <button id="upload-send">Upload</button>
     <div id="upload-status"></div>
+    <div id="upload-files"></div>
   </div>
 
   <h1>Ask the corpus</h1>
@@ -144,10 +148,58 @@
   </details>
 
   <script>
+    // Parses a text/event-stream fetch Response into its `data: {...}`
+    // events, one JS object per yield - shared by ask() and upload(),
+    // the two endpoints that stream progress this way.
+    async function* streamEvents(res) {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const chunk = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          const line = chunk.split("\n").find((l) => l.startsWith("data: "));
+          if (!line) continue;
+          yield JSON.parse(line.slice(6));
+        }
+      }
+    }
+
     const uploadFile = document.getElementById("upload-file");
     const uploadId = document.getElementById("upload-id");
     const uploadSend = document.getElementById("upload-send");
     const uploadStatus = document.getElementById("upload-status");
+    const uploadFiles = document.getElementById("upload-files");
+
+    function uploadFileEl(stage) {
+      let el = document.getElementById("upload-file-" + stage);
+      if (!el) {
+        el = document.createElement("div");
+        el.id = "upload-file-" + stage;
+        el.className = "stage";
+        uploadFiles.appendChild(el);
+      }
+      return el;
+    }
+
+    function renderUploadFile(event) {
+      const el = uploadFileEl(event.stage);
+      el.className = "stage " + event.status;
+      if (event.status === "running") {
+        el.textContent = `${event.stage}: ingesting...`;
+      } else if (event.status === "error") {
+        el.textContent = `${event.stage}: ${event.data.error}`;
+      } else {
+        el.textContent = `${event.stage}: ${event.data.chunks} chunk(s)`;
+      }
+    }
 
     async function upload() {
       const file = uploadFile.files[0];
@@ -156,6 +208,7 @@
       uploadSend.disabled = true;
       uploadStatus.className = "";
       uploadStatus.textContent = "Uploading...";
+      uploadFiles.innerHTML = "";
 
       try {
         const body = new FormData();
@@ -164,13 +217,22 @@
         const params = id ? "?" + new URLSearchParams({ id }) : "";
 
         const res = await fetch("/api/documents" + params, { method: "POST", body });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || `Server error: ${res.status}`);
+        if (!res.ok) {
+          const data = await res.json();
+          throw new Error(data.detail || `Server error: ${res.status}`);
+        }
 
-        uploadStatus.className = "ok";
-        uploadStatus.textContent =
-          `Ingested ${data.documents.length} document(s) as ${data.chunks} chunk(s): ` +
-          data.documents.join(", ");
+        for await (const event of streamEvents(res)) {
+          if (event.stage === "final") {
+            const { documents, failed, chunks } = event.data;
+            uploadStatus.className = failed.length === 0 ? "ok" : "error";
+            uploadStatus.textContent =
+              `Ingested ${documents.length} document(s) as ${chunks} chunk(s)` +
+              (failed.length === 0 ? "." : `; failed: ${failed.join(", ")}.`);
+          } else {
+            renderUploadFile(event);
+          }
+        }
         uploadFile.value = "";
         uploadId.value = "";
       } catch (err) {
@@ -251,79 +313,62 @@
         });
         if (!res.ok) throw new Error(`Server error: ${res.status}`);
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = "";
+        for await (const event of streamEvents(res)) {
+          if (event.stage === "final") {
+            answer.textContent = event.data.answer;
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-
-          let idx;
-          while ((idx = buf.indexOf("\n\n")) !== -1) {
-            const chunk = buf.slice(0, idx);
-            buf = buf.slice(idx + 2);
-            const line = chunk.split("\n").find((l) => l.startsWith("data: "));
-            if (!line) continue;
-            const event = JSON.parse(line.slice(6));
-
-            if (event.stage === "final") {
-              answer.textContent = event.data.answer;
-
-              const s = event.data.stats;
-              if (s) {
-                stats.hidden = false;
-                stats.innerHTML = [
-                  `<span>Quotes verified: ${s.answer_quotes_verified}/${s.total_facts}</span>`,
-                  `<span>Verifier: ${s.verifier_fully_supported} yes, ` +
-                    `${s.verifier_partially_supported} partial, ` +
-                    `${s.verifier_unsupported} no, ` +
-                    `${s.verifier_no_claims} declined</span>`,
-                  `<span>Sub-questions: ${s.subquestions_covered} covered, ` +
-                    `${s.subquestions_not_in_sources} not in sources, ` +
-                    `${s.subquestions_missed} missed ` +
-                    `(of ${s.subquestions_total})</span>`,
-                ].join("");
-              }
-
-              extrasBody.textContent = JSON.stringify(
-                {
-                  questions: event.data.questions,
-                  subanswers: event.data.subanswers,
-                  verification: event.data.verification,
-                  completeness: event.data.completeness,
-                  stats: event.data.stats,
-                },
-                null,
-                2,
-              );
-              extras.hidden = false;
-
-              const answerHallucinated = event.data.subanswers
-                .flatMap((sa) => sa.facts)
-                .filter((f) => !f.verified).length;
-              const verifyHallucinated =
-                event.data.verification.hallucinated_quotes || 0;
-              const completenessHallucinated =
-                event.data.completeness.hallucinated_quotes || 0;
-              const total =
-                answerHallucinated + verifyHallucinated + completenessHallucinated;
-              risk.hidden = false;
-              if (total === 0) {
-                risk.className = "ok";
-                risk.textContent = "All cited quotes verified against source chunks.";
-              } else {
-                risk.className = "warn";
-                risk.textContent =
-                  `${total} unverifiable quote(s) detected ` +
-                  `(${answerHallucinated} in the answer, ${verifyHallucinated} in ` +
-                  `verification, ${completenessHallucinated} in completeness) - ` +
-                  `treat those claims as unsupported.`;
-              }
-            } else {
-              renderStage(event);
+            const s = event.data.stats;
+            if (s) {
+              stats.hidden = false;
+              stats.innerHTML = [
+                `<span>Quotes verified: ${s.answer_quotes_verified}/${s.total_facts}</span>`,
+                `<span>Verifier: ${s.verifier_fully_supported} yes, ` +
+                  `${s.verifier_partially_supported} partial, ` +
+                  `${s.verifier_unsupported} no, ` +
+                  `${s.verifier_no_claims} declined</span>`,
+                `<span>Sub-questions: ${s.subquestions_covered} covered, ` +
+                  `${s.subquestions_not_in_sources} not in sources, ` +
+                  `${s.subquestions_missed} missed ` +
+                  `(of ${s.subquestions_total})</span>`,
+              ].join("");
             }
+
+            extrasBody.textContent = JSON.stringify(
+              {
+                questions: event.data.questions,
+                subanswers: event.data.subanswers,
+                verification: event.data.verification,
+                completeness: event.data.completeness,
+                stats: event.data.stats,
+              },
+              null,
+              2,
+            );
+            extras.hidden = false;
+
+            const answerHallucinated = event.data.subanswers
+              .flatMap((sa) => sa.facts)
+              .filter((f) => !f.verified).length;
+            const verifyHallucinated =
+              event.data.verification.hallucinated_quotes || 0;
+            const completenessHallucinated =
+              event.data.completeness.hallucinated_quotes || 0;
+            const total =
+              answerHallucinated + verifyHallucinated + completenessHallucinated;
+            risk.hidden = false;
+            if (total === 0) {
+              risk.className = "ok";
+              risk.textContent = "All cited quotes verified against source chunks.";
+            } else {
+              risk.className = "warn";
+              risk.textContent =
+                `${total} unverifiable quote(s) detected ` +
+                `(${answerHallucinated} in the answer, ${verifyHallucinated} in ` +
+                `verification, ${completenessHallucinated} in completeness) - ` +
+                `treat those claims as unsupported.`;
+            }
+          } else {
+            renderStage(event);
           }
         }
         status.textContent = "";

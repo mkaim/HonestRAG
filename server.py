@@ -7,7 +7,9 @@ question to /api/ask streams each pipeline stage as server-sent events,
 ending with the verified answer. POSTing a file to /api/documents ingests
 it the same way ingest.py's CLI does (see that module for the two modes:
 a single file with an optional id, or a .zip of many files with ids
-derived from their names).
+derived from their names) - also streamed as server-sent events, one
+running/done (or error) pair per file, so a many-file zip shows progress
+and per-file failures instead of one opaque wait.
 """
 
 import json
@@ -88,13 +90,13 @@ class AskRequest(BaseModel):
 async def _ingest_path(path: Path, doc_id: str) -> int:
     """Loads, chunks and adds one file already on disk, by its real
     extension - same loader lookup ingest.py's CLI uses. Returns the
-    chunk count. Raises HTTPException if the extension isn't supported."""
+    chunk count. Raises ValueError if the extension isn't supported, so
+    _ingest_stream can report it as this file's error without aborting
+    the rest of a multi-file upload."""
     try:
         loader = LOADERS[path.suffix.lower()]
     except KeyError:
-        raise HTTPException(
-            415, f"unsupported file type {path.suffix!r} for {doc_id!r}"
-        ) from None
+        raise ValueError(f"unsupported file type {path.suffix!r}") from None
 
     blocks, metadata = loader.load(str(path))
     chunks: list[Chunk] = list(chunker.chunk(doc_id, blocks))
@@ -102,11 +104,39 @@ async def _ingest_path(path: Path, doc_id: str) -> int:
     return len(chunks)
 
 
+async def _ingest_stream(
+    paths: list[tuple[Path, str]],
+) -> AsyncIterator[str]:
+    """One running/done (or error) SSE pair per (path, doc_id), so a
+    many-file zip shows progress and lets some files fail without losing
+    the rest, then a final summary event."""
+    ingested: list[str] = []
+    failed: list[str] = []
+    total_chunks = 0
+
+    for path, doc_id in paths:
+        yield _sse(doc_id, "running")
+        try:
+            chunk_count = await _ingest_path(path, doc_id)
+        except Exception as e:
+            failed.append(doc_id)
+            yield _sse(doc_id, "error", {"error": str(e)})
+            continue
+        ingested.append(doc_id)
+        total_chunks += chunk_count
+        yield _sse(doc_id, "done", {"chunks": chunk_count})
+
+    yield _sse(
+        "final",
+        "done",
+        {"documents": ingested, "failed": failed, "chunks": total_chunks},
+    )
+
+
 @app.post("/api/documents")
-async def add_document(
-    file: UploadFile, id: str | None = None
-) -> dict[str, int | list[str]]:
-    """Ingests an uploaded file into the corpus. A single file is one
+async def add_document(file: UploadFile, id: str | None = None) -> StreamingResponse:
+    """Ingests an uploaded file into the corpus, streaming progress as
+    server-sent events (same shape as /api/ask). A single file is one
     document - pass `id` to override the default (the uploaded filename);
     omit it to re-ingest (atomically replace) an existing document of the
     same name. A .zip is treated like ingest.py's --dir: every supported
@@ -116,45 +146,42 @@ async def add_document(
     if file.filename is None:
         raise HTTPException(400, "missing filename")
 
+    tmp = tempfile.TemporaryDirectory()
+    tmp_path = Path(tmp.name)
+
     if Path(file.filename).suffix.lower() == ".zip":
         if id is not None:
+            tmp.cleanup()
             raise HTTPException(400, "id isn't valid for a .zip upload")
-        return await _ingest_zip(file)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / file.filename
-        path.write_bytes(await file.read())
-        chunk_count = await _ingest_path(path, id or file.filename)
-
-    return {"documents": [id or file.filename], "chunks": chunk_count}
-
-
-async def _ingest_zip(file: UploadFile) -> dict[str, int | list[str]]:
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
         archive_path = tmp_path / "upload.zip"
         archive_path.write_bytes(await file.read())
-
         try:
             with zipfile.ZipFile(archive_path) as archive:
                 archive.extractall(tmp_path)
         except zipfile.BadZipFile as e:
+            tmp.cleanup()
             raise HTTPException(400, "not a valid zip file") from e
 
-        paths = sorted(
-            p
-            for p in tmp_path.rglob("*")
+        paths = [
+            (p, p.name)
+            for p in sorted(tmp_path.rglob("*"))
             if p.suffix.lower() in LOADERS and p != archive_path
-        )
+        ]
         if not paths:
+            tmp.cleanup()
             raise HTTPException(400, "zip contains no supported files")
+    else:
+        path = tmp_path / file.filename
+        path.write_bytes(await file.read())
+        paths = [(path, id or file.filename)]
 
-        document_ids = [p.name for p in paths]
-        total_chunks = 0
-        for path in paths:
-            total_chunks += await _ingest_path(path, path.name)
+    async def stream() -> AsyncIterator[str]:
+        with tmp:
+            async for event in _ingest_stream(paths):
+                yield event
 
-    return {"documents": document_ids, "chunks": total_chunks}
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @app.get("/")
