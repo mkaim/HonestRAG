@@ -94,9 +94,41 @@
     #stats span {
       white-space: nowrap;
     }
+    #upload {
+      margin-bottom: 2rem;
+      padding-bottom: 1.5rem;
+      border-bottom: 1px solid #ddd;
+    }
+    #upload-status {
+      margin-top: 0.5rem;
+      font-size: 0.9rem;
+      color: #666;
+    }
+    #upload-status.ok {
+      color: #1e7b34;
+    }
+    #upload-status.error {
+      color: #b3261e;
+    }
   </style>
 </head>
 <body>
+  <div id="upload">
+    <h1>Add documents</h1>
+    <p>
+      Upload a single file (.txt, .md, .pdf, .docx) or a .zip of several -
+      each file inside a .zip becomes its own document, named after it.
+    </p>
+    <input type="file" id="upload-file" accept=".txt,.md,.pdf,.docx,.zip" />
+    <input
+      type="text"
+      id="upload-id"
+      placeholder="document id (optional, single file only)"
+    />
+    <button id="upload-send">Upload</button>
+    <div id="upload-status"></div>
+  </div>
+
   <h1>Ask the corpus</h1>
   <textarea id="question" placeholder="Type your question..."></textarea>
   <br />
@@ -112,6 +144,45 @@
   </details>
 
   <script>
+    const uploadFile = document.getElementById("upload-file");
+    const uploadId = document.getElementById("upload-id");
+    const uploadSend = document.getElementById("upload-send");
+    const uploadStatus = document.getElementById("upload-status");
+
+    async function upload() {
+      const file = uploadFile.files[0];
+      if (!file) return;
+
+      uploadSend.disabled = true;
+      uploadStatus.className = "";
+      uploadStatus.textContent = "Uploading...";
+
+      try {
+        const body = new FormData();
+        body.append("file", file);
+        const id = uploadId.value.trim();
+        const params = id ? "?" + new URLSearchParams({ id }) : "";
+
+        const res = await fetch("/api/documents" + params, { method: "POST", body });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || `Server error: ${res.status}`);
+
+        uploadStatus.className = "ok";
+        uploadStatus.textContent =
+          `Ingested ${data.documents.length} document(s) as ${data.chunks} chunk(s): ` +
+          data.documents.join(", ");
+        uploadFile.value = "";
+        uploadId.value = "";
+      } catch (err) {
+        uploadStatus.className = "error";
+        uploadStatus.textContent = "Error: " + err.message;
+      } finally {
+        uploadSend.disabled = false;
+      }
+    }
+
+    uploadSend.addEventListener("click", upload);
+
     const question = document.getElementById("question");
     const send = document.getElementById("send");
     const status = document.getElementById("status");
