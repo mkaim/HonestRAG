@@ -4,18 +4,25 @@
 
 Serves a single static page (static/index.html) with a textarea; POSTing a
 question to /api/ask streams each pipeline stage as server-sent events,
-ending with the verified answer.
+ending with the verified answer. POSTing a file to /api/documents ingests
+it the same way ingest.py's CLI does (see that module for the two modes:
+a single file with an optional id, or a .zip of many files with ids
+derived from their names).
 """
 
 import json
+import tempfile
+import zipfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from chunkers import BlockChunker
 from config import Settings
 from db import PsqlRagDb
 from embedders import SenTranEmbedder
@@ -38,6 +45,8 @@ from llm import (
     format_prompt_prefix,
     format_query_prefix,
 )
+from loaders import LOADERS
+from models import Chunk, Document
 from rag import Rag
 
 TOP_K = 10
@@ -52,6 +61,12 @@ embedder = SenTranEmbedder(
 )
 db = PsqlRagDb(cfg.dsn, embedder)
 rag = Rag(db, RRF(), rf_limit=TOP_K)
+chunker = BlockChunker(
+    tokenizer=embedder.tokenizer,
+    content_tokens=cfg.chunk_tokens,
+    overlap_tokens=cfg.chunk_overlap_tokens,
+    breadcrumb_tokens=cfg.chunk_breadcrumb_tokens,
+)
 
 
 @asynccontextmanager
@@ -68,6 +83,78 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 class AskRequest(BaseModel):
     question: str
+
+
+async def _ingest_path(path: Path, doc_id: str) -> int:
+    """Loads, chunks and adds one file already on disk, by its real
+    extension - same loader lookup ingest.py's CLI uses. Returns the
+    chunk count. Raises HTTPException if the extension isn't supported."""
+    try:
+        loader = LOADERS[path.suffix.lower()]
+    except KeyError:
+        raise HTTPException(
+            415, f"unsupported file type {path.suffix!r} for {doc_id!r}"
+        ) from None
+
+    blocks, metadata = loader.load(str(path))
+    chunks: list[Chunk] = list(chunker.chunk(doc_id, blocks))
+    await db.add(Document(id=doc_id, metadata=metadata), chunks)
+    return len(chunks)
+
+
+@app.post("/api/documents")
+async def add_document(
+    file: UploadFile, id: str | None = None
+) -> dict[str, int | list[str]]:
+    """Ingests an uploaded file into the corpus. A single file is one
+    document - pass `id` to override the default (the uploaded filename);
+    omit it to re-ingest (atomically replace) an existing document of the
+    same name. A .zip is treated like ingest.py's --dir: every supported
+    file inside becomes its own document, id always the filename - `id`
+    isn't valid together with a .zip, since it would collide across files.
+    """
+    if file.filename is None:
+        raise HTTPException(400, "missing filename")
+
+    if Path(file.filename).suffix.lower() == ".zip":
+        if id is not None:
+            raise HTTPException(400, "id isn't valid for a .zip upload")
+        return await _ingest_zip(file)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / file.filename
+        path.write_bytes(await file.read())
+        chunk_count = await _ingest_path(path, id or file.filename)
+
+    return {"documents": [id or file.filename], "chunks": chunk_count}
+
+
+async def _ingest_zip(file: UploadFile) -> dict[str, int | list[str]]:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        archive_path = tmp_path / "upload.zip"
+        archive_path.write_bytes(await file.read())
+
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                archive.extractall(tmp_path)
+        except zipfile.BadZipFile as e:
+            raise HTTPException(400, "not a valid zip file") from e
+
+        paths = sorted(
+            p
+            for p in tmp_path.rglob("*")
+            if p.suffix.lower() in LOADERS and p != archive_path
+        )
+        if not paths:
+            raise HTTPException(400, "zip contains no supported files")
+
+        document_ids = [p.name for p in paths]
+        total_chunks = 0
+        for path in paths:
+            total_chunks += await _ingest_path(path, path.name)
+
+    return {"documents": document_ids, "chunks": total_chunks}
 
 
 @app.get("/")
