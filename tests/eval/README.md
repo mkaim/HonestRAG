@@ -24,6 +24,10 @@ Results are printed (`-s`), not asserted - there's no pass/fail threshold,
 since "did this get better" is a before/after comparison, not a fixed
 target.
 
+`test_answer_quality.py` is a separate eval on top of this one, measuring
+the answer/verify pipeline itself rather than retrieval - see
+[Answer-quality eval](#answer-quality-eval) in the findings log below.
+
 ## Corpora
 
 Neither is vendored in the repo (see `scripts/fetch_*.py` for why, and
@@ -542,3 +546,99 @@ stays multilingual): an English-only model of similar size to e5-base,
 to see whether some of this gap is multilingual capacity being spent on
 languages this corpus doesn't use, rather than a retrieval-difficulty
 ceiling no model-size change would move.
+
+## Answer-quality eval
+
+Everything above measures retrieval: does the right chunk show up in the
+ranking. It says nothing about the stage this project actually claims to
+be careful about - whether a cited quote is real, and whether the final
+answer is actually correct. `test_answer_quality.py` closes that gap, in
+two independent measurements. Not collected by default `pytest`, same as
+the retrieval eval - uses the same `eval_db`/`gold_file` fixtures, so any
+corpus the retrieval eval supports works here too:
+
+```bash
+set -a; source .env; set +a
+uv run pytest tests/eval/test_answer_quality.py -s \
+    --embed-model intfloat/multilingual-e5-small
+```
+
+### 2026-11-17 — citation corruption is caught, measured rather than assumed
+
+The project's core claim (README's "Why the verifier's own citations
+aren't trusted either") is that nothing is trusted on an LLM's word -
+every cited quote is checked in code against the real chunk it claims to
+cite (`quote_in_chunk`). Until this eval, that check had never actually
+been measured against deliberately broken citations - only one real,
+lucky catch in production (a citation pointing at the wrong chunk, caught
+by this exact mechanism) had ever been observed.
+
+`test_citation_corruption_is_caught` pulls real chunks the same way the
+live pipeline does (via `eval_db.search`, using every gold question as a
+query), then deliberately breaks a sample of their citations two ways and
+checks whether `quote_in_chunk` catches each:
+
+- **Wrong-chunk citation**: a real quote, attributed to a different chunk
+  than the one it actually came from - exactly what the real production
+  catch looked like.
+- **Fabricated quote**: text that never appears verbatim anywhere,
+  simulating a paraphrased/hallucinated citation.
+
+| Corpus | Wrong-chunk caught | Fabricated caught |
+|---|---|---|
+| D&D SRD | 100/100 | 100/100 |
+| GutenQA | 97/100 | 100/100 |
+
+Both corpora clear the test's own thresholds (fabricated quotes must
+always be caught; wrong-chunk citations must be caught >90% of the time).
+The GutenQA result not being a clean 100% is itself useful evidence this
+isn't a tautological test rigged to always pass - a wrong-chunk citation
+can still accidentally verify if the exact same sentence happens to recur
+in two different chunks (e.g. repeated boilerplate), and this measures how
+often that actually happens on a real corpus rather than assuming zero.
+
+### 2026-11-17 — end-to-end pipeline correctness: the medium tier fails almost entirely, and it's a retrieval problem, not a reasoning one
+
+`test_end_to_end_pipeline_on_gold_questions` runs the real pipeline
+(decompose → search → answer → verify → completeness - the same calls
+`server.py`'s `_ask_stream` makes) over a sample of real gold questions,
+then uses a separate LLM-judge call to score the final answer against the
+known-correct gold answer (correct/partial/wrong). Sample is split evenly
+across tiers so an unstratified random draw can't accidentally land mostly
+on the easier tier.
+
+D&D SRD, 51/55 gold questions judged (4 lost to late-run Postgres pool
+timeouts against a remote LLM endpoint - see `test_answer_quality.py`'s
+per-question `try`/`except`, which keeps partial results instead of
+losing the whole run to one slow question):
+
+| | Correct | Partial | Wrong |
+|---|---|---|---|
+| **Overall (n=51)** | 27.5% | 23.5% | 49.0% |
+| **Easy tier (n=22)** | 63.6% | 27.3% | 9.1% |
+| **Medium tier (n=29)** | **0.0%** | 20.7% | 79.3% |
+
+Answerer facts verified: 297/353 (84.1%). Verifier fully supported /
+unsupported: 277 / 53.
+
+**Medium tier scored zero questions correct, out of 29.** That's a
+striking number on its own, but it isn't a surprise given everything else
+in this file: the retrieval eval above already found medium-tier
+(multi-hop/synthesis) questions have far worse recall than easy-tier ones
+on this same corpus (e.g. the rank-distribution table above shows SRD's
+medium tier the worst-behaved of four corpora, 32% outside the top 10).
+This end-to-end result is the first evidence tying that retrieval gap to
+actual downstream answer failure, rather than treating recall and
+correctness as separate concerns - if the pipeline can't retrieve all the
+facts a medium-tier question needs, no amount of careful answering or
+verification downstream can produce a correct answer, since the answerer
+only ever writes from what retrieval actually handed it. The 84.1%
+fact-verification rate alongside a 49% wrong-answer rate reinforces this
+reading too: most of what the answerer *did* cite was real and verified -
+the failure mode here is missing facts, not hallucinated ones.
+
+Not yet done: spot-checking individual medium-tier "wrong" transcripts to
+confirm retrieval depth (rather than, say, the decomposer failing to split
+the question into the right sub-questions) is the actual bottleneck, and
+re-running this on a tier-stratified basis for GutenQA/SQuAD to see if the
+same pattern holds outside SRD.

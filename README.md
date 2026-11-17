@@ -63,6 +63,19 @@ whenever their own cited quote fails this check - the system never trusts
 an LLM's self-report of its own grounding, including the LLM whose job is
 to check grounding.
 
+This isn't just a design claim - it's measured. `tests/eval/test_answer_quality.py`
+deliberately breaks real citations (pointing a real quote at the wrong
+chunk, or fabricating a quote that never appears verbatim anywhere) and
+checks that `quote_in_chunk` actually catches them: 100% of fabricated
+quotes and 97-100% of wrong-chunk citations, across two corpora. The same
+eval also ran the full pipeline end-to-end against gold Q&A and found that
+answer correctness tracks retrieval depth closely - multi-hop ("medium"
+tier) questions scored 0% correct against 63.6% for single-fact ("easy")
+questions on the same corpus, while the fact-verification rate stayed high
+(84.1%) throughout, pointing at missing facts rather than hallucinated
+ones as the real failure mode. Full numbers and methodology in
+[`tests/eval/README.md`](tests/eval/README.md#answer-quality-eval).
+
 ## Requirements
 
 - Docker (and Docker Compose)
@@ -177,6 +190,12 @@ the chunk is downgraded, regardless of how confident the model sounded.
 
 ## Known limitations
 
+- **Multi-hop questions are far more likely to get a wrong answer than
+  single-fact ones**, and it's a retrieval-depth problem, not a
+  reasoning or verification-layer one - see
+  [`tests/eval/README.md`](tests/eval/README.md#answer-quality-eval) for
+  the measured breakdown (0% correct on "medium"-tier questions vs. 63.6%
+  on "easy" ones, same corpus).
 - **No cross-chunk contradiction detection.** Verification checks a fact
   against the one chunk it cites, not against other retrieved chunks that
   might conflict with it. If two chunks disagree with each other (e.g.
